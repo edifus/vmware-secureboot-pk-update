@@ -1,0 +1,11 @@
+# PowerShell
+*.psd1
+
+# Local logs and outputs
+*.log
+*.jsonl
+
+# Local VMware disk artifacts
+*.vmdk
+*-flat.vmdk
+*-ctk.vmdk
