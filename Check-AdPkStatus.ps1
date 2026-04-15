@@ -242,7 +242,16 @@ $validationScript = {
         $getSecureBootUefiAvailable = $null -ne (Get-Command Get-SecureBootUEFI -ErrorAction SilentlyContinue)
         $certutilAvailable = $null -ne (Get-Command certutil.exe -ErrorAction SilentlyContinue)
 
-        $secureBootEnabled = Confirm-SecureBootUEFI -ErrorAction SilentlyContinue
+        $secureBootEnabled = $null
+        try {
+            $secureBootEnabled = Confirm-SecureBootUEFI -ErrorAction Stop
+        }
+        catch {
+            if ($_.Exception.Message -match 'not support on this platform|0xc0000002') {
+                $secureBootEnabled = $false
+            }
+        }
+
         if ($null -eq $secureBootEnabled) {
             $secureBootState = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\State" -Name "UEFISecureBootEnabled" -ErrorAction SilentlyContinue
             if ($null -ne $secureBootState -and $null -ne $secureBootState.UEFISecureBootEnabled) {
@@ -253,7 +262,16 @@ $validationScript = {
         $pkValid = $false
 
         if ($getSecureBootUefiAvailable -and $certutilAvailable -and $secureBootEnabled) {
-            $pkObject = Get-SecureBootUEFI -Name PK -ErrorAction SilentlyContinue
+            $pkObject = $null
+            try {
+                $pkObject = Get-SecureBootUEFI -Name PK -ErrorAction Stop
+            }
+            catch {
+                if ($_.Exception.Message -match 'not support on this platform|0xc0000002') {
+                    $secureBootEnabled = $false
+                }
+            }
+
             $pkBytes = $null
             if ($null -ne $pkObject) {
                 $pkBytes = $pkObject.Bytes
@@ -295,7 +313,16 @@ $validationScript = {
         $hasRequiredKek2023 = $false
 
         if ($getSecureBootUefiAvailable -and $secureBootEnabled) {
-            $kekObject = Get-SecureBootUEFI -Name KEK -ErrorAction SilentlyContinue
+            $kekObject = $null
+            try {
+                $kekObject = Get-SecureBootUEFI -Name KEK -ErrorAction Stop
+            }
+            catch {
+                if ($_.Exception.Message -match 'not support on this platform|0xc0000002') {
+                    $secureBootEnabled = $false
+                }
+            }
+
             $kekBytes = $null
             if ($null -ne $kekObject) {
                 $kekBytes = $kekObject.Bytes
