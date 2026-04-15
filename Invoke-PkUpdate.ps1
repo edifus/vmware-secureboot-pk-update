@@ -3,16 +3,103 @@
 Automates Secure Boot PK update workflow for a vSphere VM.
 
 .DESCRIPTION
-This script performs an end-to-end PK enrollment flow:
-1) Pre-check snapshot state
-2) Stage PK VMDK in VM datastore folder
-3) Attach disk and snapshot VM
-4) Enable EFI auth bypass + force firmware setup
-5) Send HID key sequence for enrollment menus
-6) Cleanup VM settings and power state
+This script performs an end-to-end Platform Key (PK) enrollment workflow for
+VMware virtual machines that require Secure Boot remediation.
 
-Use -CleanupArtifactsOnly to remove snapshots, detach PK disk, and delete
-the staged PK VMDK from the VM folder after validation.
+Main workflow:
+1. Connect to vCenter Server or reuse an existing PowerCLI session.
+2. Resolve a single VM target or a batch of targets from CSV.
+3. Verify the VM does not already have snapshots.
+4. Power off the VM if needed.
+5. Copy the PK VMDK into the VM's datastore folder when necessary.
+6. Attach the PK disk and create a pre-update snapshot.
+7. Enable the required EFI settings for PK enrollment.
+8. Power on the VM and send the HID key sequence through firmware menus.
+9. Power off the VM, clear temporary EFI settings, detach the PK disk when
+   possible, and power the VM back on.
+10. Apply the PK-Fixed vCenter tag and append a JSONL log entry.
+
+Use -CleanupArtifactsOnly to remove PK update artifacts after validation. In
+cleanup mode, the script removes matching snapshots, detaches the PK disk, and
+deletes the staged PK VMDK from the VM folder without performing the enrollment
+sequence.
+
+Provide either -VMName for a single VM or -CsvPath for batch mode.
+
+.PARAMETER VMName
+The name of a single target VM to process.
+
+.PARAMETER CsvPath
+Path to a CSV file used for batch mode. The CSV must include a VMName column.
+Optional columns are PkDiskPath and SnapshotName.
+
+.PARAMETER VCServer
+The vCenter Server or VCSA hostname. If omitted, the script tries to reuse an
+existing VIServer connection in the current PowerShell session or uses the
+VC_SERVER environment variable when set.
+
+.PARAMETER Username
+Username used when creating a new vCenter connection. If omitted, the script may
+reuse an existing connection, rely on saved PowerCLI credentials, or use the
+VC_USER environment variable.
+
+.PARAMETER Password
+SecureString password paired with -Username for a new vCenter connection. If
+omitted, the script may rely on saved PowerCLI credentials or the VC_PASS
+environment variable.
+
+.PARAMETER PkDiskPath
+Datastore path to the PK VMDK source disk in the format
+[datastore] folder/file.vmdk. Defaults to [iso] secureboot.vmdk and can also be
+provided through PK_VMDK_PATH.
+
+.PARAMETER SnapshotName
+Snapshot name to use for single-VM mode. In batch mode, each row can override
+this value with a SnapshotName column; otherwise a per-VM generated name is used.
+
+.PARAMETER LogPath
+Path to the append-only JSONL log file written during execution.
+
+.PARAMETER InitialDelaySec
+Delay, in seconds, before the HID enrollment sequence begins after power-on.
+
+.PARAMETER KeyHoldMs
+Duration, in milliseconds, to hold each HID key press.
+
+.PARAMETER InterKeyMs
+Delay, in milliseconds, between repeated HID key presses.
+
+.PARAMETER StepWaitSec
+Default wait time, in seconds, between major firmware navigation steps.
+
+.PARAMETER CleanupArtifactsOnly
+Runs cleanup only. This removes snapshots, detaches the PK disk, and deletes the
+staged PK VMDK artifacts without re-running the PK enrollment workflow.
+
+.EXAMPLE
+pwsh -NoProfile -File ./Invoke-PkUpdate.ps1 -VCServer "vcenter.example.local" -VMName "target-vm"
+
+Runs the PK update workflow for a single VM.
+
+.EXAMPLE
+pwsh -NoProfile -File ./Invoke-PkUpdate.ps1 -VCServer "vcenter.example.local" -CsvPath "./vms.csv"
+
+Runs the PK update workflow for every VM listed in the CSV file.
+
+.EXAMPLE
+pwsh -NoProfile -File ./Invoke-PkUpdate.ps1 -VCServer "vcenter.example.local" -VMName "target-vm" -CleanupArtifactsOnly
+
+Removes PK update artifacts for a single VM after validation.
+
+.EXAMPLE
+pwsh -NoProfile -File ./Invoke-PkUpdate.ps1 -VMName "target-vm"
+
+Runs against a VM using an already-connected PowerCLI session.
+
+.NOTES
+Requires VMware PowerCLI, vCenter permissions for VM reconfiguration and
+snapshots, and access to the PK VMDK datastore path. The script creates or reuses
+the PK-Fixed tag in the PK Update Status category to mark successful completion.
 #>
 
 param(
@@ -363,17 +450,17 @@ function Resolve-VM {
         $VIServer
     )
 
-    $matches = @(Get-VM -Name $Name -Server $VIServer -ErrorAction Stop)
-    if ($matches.Count -eq 0) {
+    $vmMatches = @(Get-VM -Name $Name -Server $VIServer -ErrorAction Stop)
+    if ($vmMatches.Count -eq 0) {
         throw "VM '$Name' was not found on vCenter '$($VIServer.Name)'."
     }
 
-    if ($matches.Count -gt 1) {
-        $ids = ($matches | Select-Object -ExpandProperty Id) -join ", "
+    if ($vmMatches.Count -gt 1) {
+        $ids = ($vmMatches | Select-Object -ExpandProperty Id) -join ", "
         throw "Multiple VMs named '$Name' were found on vCenter '$($VIServer.Name)': $ids"
     }
 
-    return $matches[0]
+    return $vmMatches[0]
 }
 
 function Get-CurrentVM {
@@ -394,7 +481,7 @@ function Get-CurrentVMView {
     return Get-View -Id $VM.Id -Server $activeVIServerConnection -ErrorAction Stop
 }
 
-function Ensure-VmTag {
+function Set-VmTagDefinition {
     param(
         [Parameter(Mandatory = $true)]
         [string]$TagName,
@@ -424,7 +511,7 @@ function Set-PkFixedTag {
         [VMware.VimAutomation.ViCore.Types.V1.Inventory.VirtualMachine]$VM
     )
 
-    $tag = Ensure-VmTag -TagName $pkFixedTagName -CategoryName $pkFixedTagCategoryName
+    $tag = Set-VmTagDefinition -TagName $pkFixedTagName -CategoryName $pkFixedTagCategoryName
     $existingAssignment = Get-TagAssignment -Server $activeVIServerConnection -Entity $VM -Tag $tag -ErrorAction SilentlyContinue
     if ($existingAssignment) {
         Write-Status "Tag '$pkFixedTagName' is already assigned to VM '$($VM.Name)'."
@@ -435,7 +522,7 @@ function Set-PkFixedTag {
     New-TagAssignment -Server $activeVIServerConnection -Entity $VM -Tag $tag | Out-Null
 }
 
-function Ensure-PoweredOff {
+function Stop-VMIfPoweredOn {
     param(
         [Parameter(Mandatory = $true)]
         [VMware.VimAutomation.ViCore.Types.V1.Inventory.VirtualMachine]$VM
@@ -471,7 +558,7 @@ function Ensure-PoweredOff {
     }
 }
 
-function Ensure-PoweredOn {
+function Start-VMIfPoweredOff {
     param(
         [Parameter(Mandatory = $true)]
         [VMware.VimAutomation.ViCore.Types.V1.Inventory.VirtualMachine]$VM
@@ -485,7 +572,7 @@ function Ensure-PoweredOn {
     Start-VM -VM $vmCurrent -Confirm:$false | Out-Null
 }
 
-function Force-PoweredOff {
+function Stop-VMHard {
     param(
         [Parameter(Mandatory = $true)]
         [VMware.VimAutomation.ViCore.Types.V1.Inventory.VirtualMachine]$VM
@@ -558,7 +645,7 @@ function Set-AuthBypass {
     }
 }
 
-function Parse-DatastorePath {
+function ConvertFrom-DatastorePath {
     param(
         [Parameter(Mandatory = $true)]
         [string]$PathValue
@@ -584,12 +671,12 @@ function Resolve-PkDiskPathForVm {
         [string]$SourceDiskPath
     )
 
-    $sourceParts = Parse-DatastorePath -PathValue $SourceDiskPath
+    $sourceParts = ConvertFrom-DatastorePath -PathValue $SourceDiskPath
     $sourceFileName = ($sourceParts.Relative -split '/')[-1]
 
     $vmView = Get-CurrentVMView -VM $VM
     $vmPath = $vmView.Config.Files.VmPathName
-    $vmPathParts = Parse-DatastorePath -PathValue $vmPath
+    $vmPathParts = ConvertFrom-DatastorePath -PathValue $vmPath
     $vmPathTokens = $vmPathParts.Relative -split '/'
 
     if ($vmPathTokens.Length -lt 2) {
@@ -660,12 +747,12 @@ function Get-VmFolderDiskPath {
         [string]$SourceDiskPath
     )
 
-    $sourceParts = Parse-DatastorePath -PathValue $SourceDiskPath
+    $sourceParts = ConvertFrom-DatastorePath -PathValue $SourceDiskPath
     $sourceFileName = ($sourceParts.Relative -split '/')[-1]
 
     $vmView = Get-CurrentVMView -VM $VM
     $vmPath = $vmView.Config.Files.VmPathName
-    $vmPathParts = Parse-DatastorePath -PathValue $vmPath
+    $vmPathParts = ConvertFrom-DatastorePath -PathValue $vmPath
     $vmPathTokens = $vmPathParts.Relative -split '/'
 
     if ($vmPathTokens.Length -lt 2) {
@@ -697,7 +784,7 @@ function Remove-VimTaskAndWait {
     }
 }
 
-function Cleanup-PkArtifacts {
+function Remove-PkArtifacts {
     param(
         [Parameter(Mandatory = $true)]
         [VMware.VimAutomation.ViCore.Types.V1.Inventory.VirtualMachine]$VM,
@@ -710,7 +797,7 @@ function Cleanup-PkArtifacts {
     )
 
     $targetPath = Get-VmFolderDiskPath -VM $VM -SourceDiskPath $SourceDiskPath
-    $targetLeaf = ((Parse-DatastorePath -PathValue $targetPath).Relative -split '/')[-1]
+    $targetLeaf = ((ConvertFrom-DatastorePath -PathValue $targetPath).Relative -split '/')[-1]
     $targetStem = [System.IO.Path]::GetFileNameWithoutExtension($targetLeaf)
 
     # Remove PK-update snapshots before disk detach/delete.
@@ -776,7 +863,7 @@ function Find-PkHardDisk {
         [string]$TargetDatastorePath
     )
 
-    $targetParts = Parse-DatastorePath -PathValue $TargetDatastorePath
+    $targetParts = ConvertFrom-DatastorePath -PathValue $TargetDatastorePath
     $targetRelative = $targetParts.Relative
     $targetLeaf = ($targetRelative -split '/')[-1]
 
@@ -813,8 +900,8 @@ function New-UsbKeyEvent {
         [int]$UsbHidCode
     )
 
-    $event = New-Object VMware.Vim.UsbScanCodeSpecKeyEvent
-    $event.UsbHidCode = ([int64]$UsbHidCode -shl 16) -bor 7
+    $keyEvent = New-Object VMware.Vim.UsbScanCodeSpecKeyEvent
+    $keyEvent.UsbHidCode = ([int64]$UsbHidCode -shl 16) -bor 7
     $mods = New-Object VMware.Vim.UsbScanCodeSpecModifierType
     $mods.LeftControl = $false
     $mods.LeftShift = $false
@@ -824,8 +911,8 @@ function New-UsbKeyEvent {
     $mods.RightShift = $false
     $mods.RightAlt = $false
     $mods.RightGui = $false
-    $event.Modifiers = $mods
-    return $event
+    $keyEvent.Modifiers = $mods
+    return $keyEvent
 }
 
 function Send-UsbKeyPress {
@@ -855,8 +942,8 @@ function Send-UsbKeyPress {
             Write-Status "Sending $Label ($i/$Repeat)"
         }
 
-        $event = New-UsbKeyEvent -UsbHidCode $UsbHidCode
-        $spec.KeyEvents = @($event)
+        $keyEvent = New-UsbKeyEvent -UsbHidCode $UsbHidCode
+        $spec.KeyEvents = @($keyEvent)
         $null = $VMView.PutUsbScanCodes($spec)
         Start-Sleep -Milliseconds ([int]$HoldMs)
         Start-Sleep -Milliseconds ([int]$GapMs)
@@ -955,7 +1042,7 @@ function Invoke-PkUpdateForVm {
 
         if ($CleanupArtifactsOnly) {
             Write-Status "Running cleanup-only mode for VM '$($Target.VMName)'..."
-            Cleanup-PkArtifacts -VM $vm -SourceDiskPath $sourcePkDiskPath
+            Remove-PkArtifacts -VM $vm -SourceDiskPath $sourcePkDiskPath
             $script:status = "success"
             Write-Status "Cleanup-only workflow completed for VM '$($Target.VMName)'."
             return [pscustomobject]@{
@@ -978,7 +1065,7 @@ function Invoke-PkUpdateForVm {
             }
         }
 
-        Ensure-PoweredOff -VM $vm
+        Stop-VMIfPoweredOn -VM $vm
 
         $script:attachPkDiskPath = Resolve-PkDiskPathForVm -VM $vm -SourceDiskPath $sourcePkDiskPath
 
@@ -1003,12 +1090,12 @@ function Invoke-PkUpdateForVm {
         Set-EnterFirmwareSetup -VM $vm -Enabled $true
 
         Write-Status "Powering on VM '$($Target.VMName)'..."
-        Ensure-PoweredOn -VM $vm
+        Start-VMIfPoweredOff -VM $vm
 
         Write-Status "Running HID enrollment sequence..."
         Invoke-HidSequence -VM $vm
 
-        Force-PoweredOff -VM $vm
+        Stop-VMHard -VM $vm
 
         Write-Status "Removing uefi.allowAuthBypass..."
         Set-AuthBypass -VM $vm -Enabled $false
@@ -1037,7 +1124,7 @@ function Invoke-PkUpdateForVm {
         }
 
         Write-Status "Powering on VM '$($Target.VMName)'..."
-        Ensure-PoweredOn -VM $vm
+        Start-VMIfPoweredOff -VM $vm
 
         Set-PkFixedTag -VM $vm
 

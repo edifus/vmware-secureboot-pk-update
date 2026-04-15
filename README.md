@@ -50,8 +50,6 @@ export PK_VMDK_PATH='[iso] secureboot.vmdk'
 
 ## Usage
 
-## Usage
-
 ### Single VM Mode
 
 Run full PK update workflow:
@@ -143,10 +141,14 @@ On successful completion, the script adds a vCenter tag (`PK-Fixed`) to the VM i
 Run `check-pk.ps1` to list all UEFI VMs with Secure Boot enabled and their `PK-Fixed` status:
 
 ```bash
-pwsh -NoProfile -File ./check-pk.ps1
+pwsh -NoProfile -File ./check-pk.ps1 -VCServer "vcenter.example.local"
 ```
 
-(Requires an active vCenter connection or set `VC_SERVER`/`VC_USER`/`VC_PASS` first.)
+Export the report to `./Affected_SecureBoot_VMs.csv`:
+
+```bash
+pwsh -NoProfile -File ./check-pk.ps1 -VCServer "vcenter.example.local" -ExportCsv
+```
 
 ## Logging
 
