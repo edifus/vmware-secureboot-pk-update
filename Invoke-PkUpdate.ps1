@@ -417,8 +417,6 @@ function Cleanup-PkArtifacts {
     $targetLeaf = ((Parse-DatastorePath -PathValue $targetPath).Relative -split '/')[-1]
     $targetStem = [System.IO.Path]::GetFileNameWithoutExtension($targetLeaf)
 
-    Ensure-PoweredOff -VM $VM
-
     # Remove PK-update snapshots before disk detach/delete.
     $snapshots = Get-Snapshot -VM $VM -ErrorAction SilentlyContinue
     if ($snapshots) {
@@ -665,7 +663,6 @@ try {
     if ($CleanupArtifactsOnly) {
         Write-Host "Running cleanup-only mode..."
         Cleanup-PkArtifacts -VM $vm -SourceDiskPath $sourcePkDiskPath
-        Ensure-PoweredOn -VM $vm
         $status = "success"
         Write-Host "Cleanup-only workflow completed."
         return

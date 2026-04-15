@@ -106,7 +106,7 @@ Each run appends one JSON line including status, VM, vCenter, snapshot info, dis
 
 - Keep the pre-update snapshot until validation is complete.
 - VMware does not allow detaching a disk that is part of an active snapshot chain.
-- Cleanup mode removes snapshots and then detaches/deletes staged PK disk artifacts.
+- Cleanup mode removes snapshots and then detaches/deletes staged PK disk artifacts without changing VM power state.
 
 ## License
 
