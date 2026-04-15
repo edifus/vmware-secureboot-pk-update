@@ -10,7 +10,10 @@ PowerCLI automation for VMware Secure Boot Platform Key (PK) enrollment with sna
 - Sends USB HID keystrokes to drive firmware enrollment menus.
 - Cleans up EFI settings and restores normal boot behavior.
 - Supports cleanup-only mode to remove snapshots, detach disk, and delete staged PK VMDK.
+- Adds a `PK-Fixed` vCenter tag to mark completed VMs.
 - Writes append-only JSONL run logs.
+- Supports single VM or batch mode via CSV.
+- Reuses existing vCenter connection if already connected.
 
 ## Requirements
 
@@ -21,9 +24,10 @@ PowerCLI automation for VMware Secure Boot Platform Key (PK) enrollment with sna
   - Snapshot create/remove
   - Virtual disk copy/delete
 
-## Script
+## Scripts
 
-- `Invoke-PkUpdate.ps1`
+- `Invoke-PkUpdate.ps1` - Main workflow
+- `check-pk.ps1` - Status checker (lists UEFI VMs and their PK-Fixed tag status)
 
 ## Environment Variables
 
@@ -46,6 +50,10 @@ export PK_VMDK_PATH='[iso] secureboot.vmdk'
 
 ## Usage
 
+## Usage
+
+### Single VM Mode
+
 Run full PK update workflow:
 
 ```bash
@@ -62,6 +70,38 @@ Override PK disk path directly:
 
 ```bash
 pwsh -NoProfile -File ./Invoke-PkUpdate.ps1 -VCServer "vcenter.example.local" -VMName "target-vm" -PkDiskPath "[iso] secureboot.vmdk"
+```
+
+### Batch Mode (CSV)
+
+Create a CSV file with the following columns:
+
+- `VMName` (required)
+- `PkDiskPath` (optional - defaults to global `-PkDiskPath`)
+- `SnapshotName` (optional - auto-generated if omitted)
+
+Example `vms.csv`:
+
+```csv
+VMName,PkDiskPath,SnapshotName
+vmware-linux,[iso] secureboot.vmdk,pre-pk-update-vmware-linux-20260410
+webserver-01,[iso] secureboot.vmdk,
+db-server-02,
+```
+
+Run batch mode:
+
+```bash
+pwsh -NoProfile -File ./Invoke-PkUpdate.ps1 -VCServer "vcenter.example.local" -CsvPath "./vms.csv"
+```
+
+### Connection Reuse
+
+If you already have an active vCenter connection in your PowerShell session, you can omit `-VCServer`:
+
+```powershell
+Connect-VIServer -Server "vcenter.example.local"  # once
+pwsh -NoProfile -File ./Invoke-PkUpdate.ps1 -VMName "target-vm"  # reuses connection
 ```
 
 ## PK Disk Preparation (VMDK)
@@ -93,6 +133,20 @@ Windows example:
 - Copy `WindowsOEMDevicesPK.der` to the new volume.
 
 Then place or upload the prepared VMDK in a datastore and set `PK_VMDK_PATH`.
+
+## Tagging
+
+On successful completion, the script adds a vCenter tag (`PK-Fixed`) to the VM in the category `PK Update Status`. This helps track which VMs have been updated.
+
+## Status Checker
+
+Run `check-pk.ps1` to list all UEFI VMs with Secure Boot enabled and their `PK-Fixed` status:
+
+```bash
+pwsh -NoProfile -File ./check-pk.ps1
+```
+
+(Requires an active vCenter connection or set `VC_SERVER`/`VC_USER`/`VC_PASS` first.)
 
 ## Logging
 

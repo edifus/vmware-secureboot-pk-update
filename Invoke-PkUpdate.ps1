@@ -16,8 +16,12 @@ the staged PK VMDK from the VM folder after validation.
 #>
 
 param(
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $false)]
     [string]$VMName,
+
+    [Parameter(Mandatory = $false)]
+    [Alias("csv")]
+    [string]$CsvPath,
 
     [Parameter(Mandatory = $false)]
     [string]$VCServer,
@@ -72,10 +76,6 @@ if ($env:PK_VMDK_PATH -and -not $PSBoundParameters.ContainsKey("PkDiskPath")) {
     $PkDiskPath = $env:PK_VMDK_PATH
 }
 
-if (-not $VCServer) {
-    throw "VCServer is required. Pass -VCServer or set VC_SERVER."
-}
-
 if (Get-Command Set-PowerCLIConfiguration -ErrorAction SilentlyContinue) {
     Set-PowerCLIConfiguration -Scope Session -InvalidCertificateAction Ignore -Confirm:$false | Out-Null
 }
@@ -86,6 +86,42 @@ $status = "started"
 $failureMessage = $null
 $sourcePkDiskPath = $PkDiskPath
 $attachPkDiskPath = $PkDiskPath
+$pkFixedTagName = "PK-Fixed"
+$pkFixedTagCategoryName = "PK Update Status"
+$openedVIServerConnection = $false
+$activeVIServerConnection = $null
+$currentVMName = $VMName
+$batchResults = @()
+
+function Write-Status {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Message,
+
+        [Parameter(Mandatory = $false)]
+        [ConsoleColor]$Color = [ConsoleColor]::Green
+    )
+
+    Write-Host $Message -ForegroundColor $Color
+}
+
+function Write-StatusWarning {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Message
+    )
+
+    Write-Host "WARNING: $Message" -ForegroundColor Yellow
+}
+
+function Write-StatusError {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Message
+    )
+
+    Write-Host "ERROR: $Message" -ForegroundColor Red
+}
 
 function Write-RunLog {
     param(
@@ -106,7 +142,7 @@ function Write-RunLog {
         runId                = $runId
         timestampUtc         = (Get-Date).ToUniversalTime().ToString("o")
         vcServer             = $VCServer
-        vmName               = $VMName
+        vmName               = $currentVMName
         sourcePkDiskPath     = $sourcePkDiskPath
         attachPkDiskPath     = $attachPkDiskPath
         snapshotName         = $SnapshotNameValue
@@ -117,6 +153,76 @@ function Write-RunLog {
 
     $jsonLine = $entry | ConvertTo-Json -Compress
     Add-Content -Path $LogPath -Value $jsonLine
+}
+
+function New-GeneratedSnapshotName {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TargetVMName
+    )
+
+    return "pre-pk-update-$TargetVMName-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+}
+
+function Get-TargetVmSpecs {
+    param(
+        [Parameter(Mandatory = $false)]
+        [string]$SingleVMName,
+
+        [Parameter(Mandatory = $false)]
+        [string]$CsvFilePath
+    )
+
+    if ($SingleVMName -and $CsvFilePath) {
+        throw "Specify either -VMName or -CsvPath, not both."
+    }
+
+    if (-not $SingleVMName -and -not $CsvFilePath) {
+        throw "Specify -VMName for a single VM or -CsvPath for batch mode."
+    }
+
+    if ($SingleVMName) {
+        return @([pscustomobject]@{
+            VMName       = $SingleVMName
+            PkDiskPath   = $PkDiskPath
+            SnapshotName = $SnapshotName
+        })
+    }
+
+    $resolvedCsvPath = Resolve-Path -Path $CsvFilePath -ErrorAction Stop
+    $rows = @(Import-Csv -Path $resolvedCsvPath)
+    if ($rows.Count -eq 0) {
+        throw "CSV file '$resolvedCsvPath' does not contain any rows."
+    }
+
+    $targets = @()
+    foreach ($row in $rows) {
+        $rowVmName = $row.PSObject.Properties["VMName"]
+        if (-not $rowVmName -or [string]::IsNullOrWhiteSpace([string]$rowVmName.Value)) {
+            throw "CSV file '$resolvedCsvPath' must contain a non-empty 'VMName' column for every row."
+        }
+
+        $rowPkDiskPath = $PkDiskPath
+        $rowSnapshotName = New-GeneratedSnapshotName -TargetVMName ([string]$rowVmName.Value)
+
+        $pkDiskProperty = $row.PSObject.Properties["PkDiskPath"]
+        if ($pkDiskProperty -and -not [string]::IsNullOrWhiteSpace([string]$pkDiskProperty.Value)) {
+            $rowPkDiskPath = [string]$pkDiskProperty.Value
+        }
+
+        $snapshotProperty = $row.PSObject.Properties["SnapshotName"]
+        if ($snapshotProperty -and -not [string]::IsNullOrWhiteSpace([string]$snapshotProperty.Value)) {
+            $rowSnapshotName = [string]$snapshotProperty.Value
+        }
+
+        $targets += [pscustomobject]@{
+            VMName       = [string]$rowVmName.Value
+            PkDiskPath   = $rowPkDiskPath
+            SnapshotName = $rowSnapshotName
+        }
+    }
+
+    return $targets
 }
 
 function Get-LoginCredential {
@@ -140,35 +246,224 @@ function Get-LoginCredential {
     return $null
 }
 
+function Get-ConnectedVIServer {
+    param(
+        [Parameter(Mandatory = $false)]
+        [string]$ServerName
+    )
+
+    $connectedServers = @()
+
+    $defaultVIServerVar = Get-Variable -Name DefaultVIServer -Scope Global -ErrorAction SilentlyContinue
+    if ($defaultVIServerVar -and $null -ne $defaultVIServerVar.Value) {
+        $connectedServers += @($defaultVIServerVar.Value)
+    }
+
+    $defaultVIServersVar = Get-Variable -Name DefaultVIServers -Scope Global -ErrorAction SilentlyContinue
+    if ($defaultVIServersVar -and $null -ne $defaultVIServersVar.Value) {
+        $connectedServers += @($defaultVIServersVar.Value)
+    }
+
+    $connectedServers = @(
+        $connectedServers |
+        Where-Object {
+            $null -ne $_ -and
+            $_ -isnot [string] -and
+            $_.PSObject.Properties["Name"] -and
+            $_.PSObject.Properties["IsConnected"] -and
+            $_.IsConnected
+        } |
+        Sort-Object { Get-VIServerName -Server $_ } -Unique
+    )
+
+    if ($connectedServers.Count -eq 0) {
+        return @()
+    }
+
+    if ($ServerName) {
+        $matchedServer = $connectedServers | Where-Object { (Get-VIServerName -Server $_) -eq $ServerName } | Select-Object -First 1
+        if ($null -ne $matchedServer) {
+            return $matchedServer
+        }
+
+        return @()
+    }
+
+    if ($connectedServers.Count -eq 1) {
+        return $connectedServers[0]
+    }
+
+    return @()
+}
+
+function Get-VIServerName {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Server
+    )
+
+    if ($null -eq $Server) {
+        return $null
+    }
+
+    $nameProperty = $Server.PSObject.Properties["Name"]
+    if ($nameProperty) {
+        return [string]$nameProperty.Value
+    }
+
+    return [string]$Server
+}
+
+function Get-TaskErrorMessage {
+    param(
+        [Parameter(Mandatory = $false)]
+        $TaskError
+    )
+
+    if ($null -eq $TaskError) {
+        return "Unknown task error."
+    }
+
+    if ($TaskError -is [System.Array] -or $TaskError -is [System.Collections.IEnumerable] -and $TaskError -isnot [string]) {
+        $messages = @()
+        foreach ($item in $TaskError) {
+            $itemMessage = Get-TaskErrorMessage -TaskError $item
+            if ($itemMessage) {
+                $messages += $itemMessage
+            }
+        }
+
+        $messages = @($messages | Where-Object { $_ } | Select-Object -Unique)
+        if ($messages.Count -gt 0) {
+            return ($messages -join "; ")
+        }
+    }
+
+    foreach ($propertyName in @("LocalizedMessage", "Message")) {
+        $property = $TaskError.PSObject.Properties[$propertyName]
+        if ($property -and $property.Value) {
+            return [string]$property.Value
+        }
+    }
+
+    $faultProperty = $TaskError.PSObject.Properties["Fault"]
+    if ($faultProperty -and $faultProperty.Value) {
+        return Get-TaskErrorMessage -TaskError $faultProperty.Value
+    }
+
+    return [string]$TaskError
+}
+
+function Resolve-VM {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+
+        [Parameter(Mandatory = $true)]
+        $VIServer
+    )
+
+    $matches = @(Get-VM -Name $Name -Server $VIServer -ErrorAction Stop)
+    if ($matches.Count -eq 0) {
+        throw "VM '$Name' was not found on vCenter '$($VIServer.Name)'."
+    }
+
+    if ($matches.Count -gt 1) {
+        $ids = ($matches | Select-Object -ExpandProperty Id) -join ", "
+        throw "Multiple VMs named '$Name' were found on vCenter '$($VIServer.Name)': $ids"
+    }
+
+    return $matches[0]
+}
+
+function Get-CurrentVM {
+    param(
+        [Parameter(Mandatory = $true)]
+        [VMware.VimAutomation.ViCore.Types.V1.Inventory.VirtualMachine]$VM
+    )
+
+    return Get-VM -Id $VM.Id -Server $activeVIServerConnection -ErrorAction Stop
+}
+
+function Get-CurrentVMView {
+    param(
+        [Parameter(Mandatory = $true)]
+        [VMware.VimAutomation.ViCore.Types.V1.Inventory.VirtualMachine]$VM
+    )
+
+    return Get-View -Id $VM.Id -Server $activeVIServerConnection -ErrorAction Stop
+}
+
+function Ensure-VmTag {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TagName,
+
+        [Parameter(Mandatory = $true)]
+        [string]$CategoryName
+    )
+
+    $category = Get-TagCategory -Server $activeVIServerConnection -Name $CategoryName -ErrorAction SilentlyContinue
+    if (-not $category) {
+        Write-Status "Creating tag category '$CategoryName'..."
+        $category = New-TagCategory -Server $activeVIServerConnection -Name $CategoryName -Cardinality Single -EntityType VirtualMachine
+    }
+
+    $tag = Get-Tag -Server $activeVIServerConnection -Name $TagName -Category $category -ErrorAction SilentlyContinue
+    if (-not $tag) {
+        Write-Status "Creating tag '$TagName'..."
+        $tag = New-Tag -Server $activeVIServerConnection -Name $TagName -Category $category
+    }
+
+    return $tag
+}
+
+function Set-PkFixedTag {
+    param(
+        [Parameter(Mandatory = $true)]
+        [VMware.VimAutomation.ViCore.Types.V1.Inventory.VirtualMachine]$VM
+    )
+
+    $tag = Ensure-VmTag -TagName $pkFixedTagName -CategoryName $pkFixedTagCategoryName
+    $existingAssignment = Get-TagAssignment -Server $activeVIServerConnection -Entity $VM -Tag $tag -ErrorAction SilentlyContinue
+    if ($existingAssignment) {
+        Write-Status "Tag '$pkFixedTagName' is already assigned to VM '$($VM.Name)'."
+        return
+    }
+
+    Write-Status "Assigning tag '$pkFixedTagName' to VM '$($VM.Name)'..."
+    New-TagAssignment -Server $activeVIServerConnection -Entity $VM -Tag $tag | Out-Null
+}
+
 function Ensure-PoweredOff {
     param(
         [Parameter(Mandatory = $true)]
         [VMware.VimAutomation.ViCore.Types.V1.Inventory.VirtualMachine]$VM
     )
 
-    $vmCurrent = Get-VM -Id $VM.Id
+    $vmCurrent = Get-CurrentVM -VM $VM
     if ($vmCurrent.PowerState -eq "PoweredOff") {
         return
     }
 
-    Write-Host "Shutting down guest on VM '$($vmCurrent.Name)'..."
+    Write-Status "Shutting down guest on VM '$($vmCurrent.Name)'..."
     try {
         Shutdown-VMGuest -VM $vmCurrent -Confirm:$false | Out-Null
     }
     catch {
-        Write-Warning "Guest shutdown request failed. Falling back to hard power off."
+        Write-StatusWarning "Guest shutdown request failed. Falling back to hard power off."
     }
 
     $deadline = (Get-Date).AddMinutes(5)
     do {
         Start-Sleep -Seconds 5
-        $vmCurrent = Get-VM -Id $VM.Id
+        $vmCurrent = Get-CurrentVM -VM $VM
     } until ($vmCurrent.PowerState -eq "PoweredOff" -or (Get-Date) -gt $deadline)
 
     if ($vmCurrent.PowerState -ne "PoweredOff") {
-        Write-Warning "Graceful shutdown timed out. Forcing power off."
+        Write-StatusWarning "Graceful shutdown timed out. Forcing power off."
         Stop-VM -VM $vmCurrent -Confirm:$false | Out-Null
-        $vmCurrent = Get-VM -Id $VM.Id
+        $vmCurrent = Get-CurrentVM -VM $VM
     }
 
     if ($vmCurrent.PowerState -ne "PoweredOff") {
@@ -182,7 +477,7 @@ function Ensure-PoweredOn {
         [VMware.VimAutomation.ViCore.Types.V1.Inventory.VirtualMachine]$VM
     )
 
-    $vmCurrent = Get-VM -Id $VM.Id
+    $vmCurrent = Get-CurrentVM -VM $VM
     if ($vmCurrent.PowerState -eq "PoweredOn") {
         return
     }
@@ -196,15 +491,15 @@ function Force-PoweredOff {
         [VMware.VimAutomation.ViCore.Types.V1.Inventory.VirtualMachine]$VM
     )
 
-    $vmCurrent = Get-VM -Id $VM.Id
+    $vmCurrent = Get-CurrentVM -VM $VM
     if ($vmCurrent.PowerState -eq "PoweredOff") {
         return
     }
 
-    Write-Host "Powering off VM '$($vmCurrent.Name)'..."
+    Write-Status "Powering off VM '$($vmCurrent.Name)'..."
     Stop-VM -VM $vmCurrent -Confirm:$false | Out-Null
 
-    $vmCurrent = Get-VM -Id $VM.Id
+    $vmCurrent = Get-CurrentVM -VM $VM
     if ($vmCurrent.PowerState -ne "PoweredOff") {
         throw "VM '$($vmCurrent.Name)' did not reach PoweredOff state after hard power off."
     }
@@ -219,21 +514,21 @@ function Set-EnterFirmwareSetup {
         [bool]$Enabled
     )
 
-    $vmView = Get-View -Id $VM.Id
+    $vmView = Get-CurrentVMView -VM $VM
     $spec = New-Object VMware.Vim.VirtualMachineConfigSpec
     $spec.BootOptions = New-Object VMware.Vim.VirtualMachineBootOptions
     $spec.BootOptions.EnterBIOSSetup = $Enabled
 
     $taskRef = $vmView.ReconfigVM_Task($spec)
-    $taskView = Get-View -Id $taskRef
+    $taskView = Get-View -Id $taskRef -Server $activeVIServerConnection
 
     while ($taskView.Info.State -eq "running" -or $taskView.Info.State -eq "queued") {
         Start-Sleep -Seconds 1
-        $taskView = Get-View -Id $taskRef
+        $taskView = Get-View -Id $taskRef -Server $activeVIServerConnection
     }
 
     if ($taskView.Info.State -ne "success") {
-        $errMsg = $taskView.Info.Error.LocalizedMessage
+        $errMsg = Get-TaskErrorMessage -TaskError $taskView.Info.Error
         throw "Failed to update boot options: $errMsg"
     }
 }
@@ -269,7 +564,8 @@ function Parse-DatastorePath {
         [string]$PathValue
     )
 
-    if ($PathValue -notmatch '^\[(?<ds>[^\]]+)\]\s(?<rel>.+)$') {
+    $normalizedPathValue = [string]$PathValue
+    if ($normalizedPathValue -notmatch '^\[(?<ds>[^\]]+)\]\s(?<rel>.+)$') {
         throw "Datastore path '$PathValue' is not in expected format: [datastore] folder/file.vmdk"
     }
 
@@ -291,7 +587,7 @@ function Resolve-PkDiskPathForVm {
     $sourceParts = Parse-DatastorePath -PathValue $SourceDiskPath
     $sourceFileName = ($sourceParts.Relative -split '/')[-1]
 
-    $vmView = Get-View -Id $VM.Id
+    $vmView = Get-CurrentVMView -VM $VM
     $vmPath = $vmView.Config.Files.VmPathName
     $vmPathParts = Parse-DatastorePath -PathValue $vmPath
     $vmPathTokens = $vmPathParts.Relative -split '/'
@@ -304,13 +600,13 @@ function Resolve-PkDiskPathForVm {
     $destinationDiskPath = "[$($vmPathParts.Datastore)] $vmFolder/$sourceFileName"
 
     if ($destinationDiskPath -eq $SourceDiskPath) {
-        Write-Host "PK disk already on VM datastore/folder: '$destinationDiskPath'."
+        Write-Status "PK disk already on VM datastore/folder: '$destinationDiskPath'."
         return $destinationDiskPath
     }
 
-    Write-Host "Copying PK disk to VM datastore folder..."
-    Write-Host "  Source: $SourceDiskPath"
-    Write-Host "  Dest:   $destinationDiskPath"
+    Write-Status "Copying PK disk to VM datastore folder..."
+    Write-Status "  Source: $SourceDiskPath"
+    Write-Status "  Dest:   $destinationDiskPath"
 
     $datacenterView = ($VM | Get-Datacenter | Select-Object -First 1 | Get-View)
     $serviceInstance = Get-View ServiceInstance
@@ -333,9 +629,9 @@ function Resolve-PkDiskPathForVm {
         }
 
         if ($copyTask.Info.State -ne "success") {
-            $copyError = $copyTask.Info.Error.LocalizedMessage
+            $copyError = Get-TaskErrorMessage -TaskError $copyTask.Info.Error
             if ($copyError -and $copyError -match "already exists") {
-                Write-Host "Destination PK disk already exists, reusing it."
+                Write-Status "Destination PK disk already exists, reusing it."
             }
             else {
                 throw "CopyVirtualDisk_Task failed: $copyError"
@@ -345,7 +641,7 @@ function Resolve-PkDiskPathForVm {
     catch {
         $msg = $_.Exception.Message
         if ($msg -match "already exists") {
-            Write-Host "Destination PK disk already exists, reusing it."
+            Write-Status "Destination PK disk already exists, reusing it."
         }
         else {
             throw
@@ -367,7 +663,7 @@ function Get-VmFolderDiskPath {
     $sourceParts = Parse-DatastorePath -PathValue $SourceDiskPath
     $sourceFileName = ($sourceParts.Relative -split '/')[-1]
 
-    $vmView = Get-View -Id $VM.Id
+    $vmView = Get-CurrentVMView -VM $VM
     $vmPath = $vmView.Config.Files.VmPathName
     $vmPathParts = Parse-DatastorePath -PathValue $vmPath
     $vmPathTokens = $vmPathParts.Relative -split '/'
@@ -389,14 +685,14 @@ function Remove-VimTaskAndWait {
         [string]$ActionName
     )
 
-    $taskView = Get-View -Id $TaskRef
+    $taskView = Get-View -Id $TaskRef -Server $activeVIServerConnection
     while ($taskView.Info.State -eq "running" -or $taskView.Info.State -eq "queued") {
         Start-Sleep -Seconds 2
-        $taskView = Get-View -Id $TaskRef
+        $taskView = Get-View -Id $TaskRef -Server $activeVIServerConnection
     }
 
     if ($taskView.Info.State -ne "success") {
-        $errMsg = $taskView.Info.Error.LocalizedMessage
+        $errMsg = Get-TaskErrorMessage -TaskError $taskView.Info.Error
         throw "$ActionName failed: $errMsg"
     }
 }
@@ -426,7 +722,7 @@ function Cleanup-PkArtifacts {
         }
 
         $snapNames = ($targetSnapshots | Select-Object -ExpandProperty Name) -join ", "
-        Write-Host "Removing snapshot(s): $snapNames"
+        Write-Status "Removing snapshot(s): $snapNames"
         $targetSnapshots | Remove-Snapshot -Confirm:$false | Out-Null
     }
 
@@ -443,11 +739,11 @@ function Cleanup-PkArtifacts {
 
     if ($disksToDetach.Count -gt 0) {
         $detachPaths = ($disksToDetach | ForEach-Object { if ($_.Filename) { $_.Filename } else { $_.FileName } }) -join ", "
-        Write-Host "Detaching PK disk(s): $detachPaths"
+        Write-Status "Detaching PK disk(s): $detachPaths"
         $disksToDetach | Remove-HardDisk -Confirm:$false -DeletePermanently:$false | Out-Null
     }
     else {
-        Write-Host "No attached PK disk found to detach."
+        Write-Status "No attached PK disk found to detach."
     }
 
     $datacenterView = ($VM | Get-Datacenter | Select-Object -First 1 | Get-View)
@@ -455,15 +751,15 @@ function Cleanup-PkArtifacts {
     $vdm = Get-View -Id $serviceInstance.Content.VirtualDiskManager
 
     # Delete only the staged PK disk in the VM folder.
-    Write-Host "Deleting PK disk in VM folder: $targetPath"
+    Write-Status "Deleting PK disk in VM folder: $targetPath"
     try {
         $deleteTaskRef = $vdm.DeleteVirtualDisk_Task($targetPath, $datacenterView.MoRef)
         Remove-VimTaskAndWait -TaskRef $deleteTaskRef -ActionName "DeleteVirtualDisk_Task"
     }
     catch {
         $msg = $_.Exception.Message
-        if ($msg -match "Could not find" -or $msg -match "No such file") {
-            Write-Host "PK disk file already absent in VM folder."
+        if ($msg -match "Could not find" -or $msg -match "No such file" -or $msg -match "was not found") {
+            Write-Status "PK disk file already absent in VM folder."
         }
         else {
             throw
@@ -556,7 +852,7 @@ function Send-UsbKeyPress {
     $spec = New-Object VMware.Vim.UsbScanCodeSpec
     for ($i = 1; $i -le $Repeat; $i++) {
         if ($Label) {
-            Write-Host "Sending $Label ($i/$Repeat)"
+            Write-Status "Sending $Label ($i/$Repeat)"
         }
 
         $event = New-UsbKeyEvent -UsbHidCode $UsbHidCode
@@ -577,10 +873,10 @@ function Wait-Step {
     )
 
     if ($Reason) {
-        Write-Host "Waiting $Seconds sec: $Reason"
+        Write-Status "Waiting $Seconds sec: $Reason"
     }
     else {
-        Write-Host "Waiting $Seconds sec"
+        Write-Status "Waiting $Seconds sec"
     }
 
     Start-Sleep -Seconds $Seconds
@@ -599,9 +895,9 @@ function Invoke-HidSequence {
         DOWN  = 0x51
     }
 
-    $vmView = Get-View -Id $VM.Id
+    $vmView = Get-CurrentVMView -VM $VM
     if ($InitialDelaySec -gt 0) {
-        Write-Host "Sequence starts in $InitialDelaySec sec..."
+        Write-Status "Sequence starts in $InitialDelaySec sec..."
         Start-Sleep -Seconds $InitialDelaySec
     }
 
@@ -640,123 +936,211 @@ function Invoke-HidSequence {
     Wait-Step -Seconds $StepWaitSec -Reason "FIRE!"
 }
 
-$cred = Get-LoginCredential -User $Username -Pass $Password
+function Invoke-PkUpdateForVm {
+    param(
+        [Parameter(Mandatory = $true)]
+        [psobject]$Target
+    )
 
-try {
-    if ($cred) {
-        Connect-VIServer -Server $VCServer -Credential $cred | Out-Null
-    }
-    elseif ($Username) {
-        try {
-            Connect-VIServer -Server $VCServer -User $Username -ErrorAction Stop | Out-Null
+    $script:currentVMName = $Target.VMName
+    $script:runId = [Guid]::NewGuid().ToString()
+    $script:snapshotCreatedAtUtc = $null
+    $script:status = "started"
+    $script:failureMessage = $null
+    $script:sourcePkDiskPath = $Target.PkDiskPath
+    $script:attachPkDiskPath = $Target.PkDiskPath
+
+    try {
+        $vm = Resolve-VM -Name $Target.VMName -VIServer $activeVIServerConnection
+
+        if ($CleanupArtifactsOnly) {
+            Write-Status "Running cleanup-only mode for VM '$($Target.VMName)'..."
+            Cleanup-PkArtifacts -VM $vm -SourceDiskPath $sourcePkDiskPath
+            $script:status = "success"
+            Write-Status "Cleanup-only workflow completed for VM '$($Target.VMName)'."
+            return [pscustomobject]@{
+                VMName = $Target.VMName
+                Status = $status
+                Error  = $null
+            }
         }
-        catch {
-            throw "Unable to authenticate for '$Username' on '$VCServer'. Provide -Password, set VC_PASS, or save credentials in PowerCLI credential store."
+
+        $existingSnapshots = Get-Snapshot -VM $vm -ErrorAction SilentlyContinue
+        if ($existingSnapshots) {
+            $snapshotList = ($existingSnapshots | Select-Object -ExpandProperty Name) -join ", "
+            $script:status = "aborted"
+            Write-StatusError "VM '$($Target.VMName)' already has snapshot(s): $snapshotList. Aborting."
+            Write-RunLog -Status $status -ErrorMessage "Existing snapshots found: $snapshotList" -SnapshotNameValue $Target.SnapshotName
+            return [pscustomobject]@{
+                VMName = $Target.VMName
+                Status = $status
+                Error  = "Existing snapshots found: $snapshotList"
+            }
         }
-    }
-    else {
-        Connect-VIServer -Server $VCServer | Out-Null
-    }
 
-    $vm = Get-VM -Name $VMName -ErrorAction Stop
+        Ensure-PoweredOff -VM $vm
 
-    if ($CleanupArtifactsOnly) {
-        Write-Host "Running cleanup-only mode..."
-        Cleanup-PkArtifacts -VM $vm -SourceDiskPath $sourcePkDiskPath
-        $status = "success"
-        Write-Host "Cleanup-only workflow completed."
-        return
-    }
-    $existingSnapshots = Get-Snapshot -VM $vm -ErrorAction SilentlyContinue
-    if ($existingSnapshots) {
-        $snapshotList = ($existingSnapshots | Select-Object -ExpandProperty Name) -join ", "
-        $status = "aborted"
-        Write-Error "VM '$VMName' already has snapshot(s): $snapshotList. Aborting."
-        Write-RunLog -Status $status -ErrorMessage "Existing snapshots found: $snapshotList" -SnapshotNameValue $SnapshotName
-        return
-    }
+        $script:attachPkDiskPath = Resolve-PkDiskPathForVm -VM $vm -SourceDiskPath $sourcePkDiskPath
 
-    Ensure-PoweredOff -VM $vm
-
-    $attachPkDiskPath = Resolve-PkDiskPathForVm -VM $vm -SourceDiskPath $sourcePkDiskPath
-
-    Write-Host "Attaching PK disk '$attachPkDiskPath'..."
-    $pkDiskExisting = @(Find-PkHardDisk -VM $vm -TargetDatastorePath $attachPkDiskPath)
-    if ($pkDiskExisting.Count -eq 0) {
-        New-HardDisk -VM $vm -DiskPath $attachPkDiskPath -Confirm:$false | Out-Null
-    }
-    else {
-        Write-Host "PK disk already attached, continuing."
-    }
-
-    Write-Host "Creating snapshot '$SnapshotName'..."
-    New-Snapshot -VM $vm -Name $SnapshotName -Description "Pre Microsoft PK enrollment" -Memory:$false -Quiesce:$false | Out-Null
-    $snapshotCreatedAtUtc = (Get-Date).ToUniversalTime().ToString("o")
-    Write-RunLog -Status "snapshot_created" -SnapshotCreatedUtc $snapshotCreatedAtUtc -SnapshotNameValue $SnapshotName
-
-    Write-Host "Setting uefi.allowAuthBypass=TRUE..."
-    Set-AuthBypass -VM $vm -Enabled $true
-
-    Write-Host "Forcing next boot into firmware setup..."
-    Set-EnterFirmwareSetup -VM $vm -Enabled $true
-
-    Write-Host "Powering on VM '$VMName'..."
-    Ensure-PoweredOn -VM $vm
-
-    Write-Host "Running HID enrollment sequence..."
-    Invoke-HidSequence -VM $vm
-
-    Force-PoweredOff -VM $vm
-
-    Write-Host "Removing uefi.allowAuthBypass..."
-    Set-AuthBypass -VM $vm -Enabled $false
-
-    Write-Host "Clearing forced firmware setup flag..."
-    Set-EnterFirmwareSetup -VM $vm -Enabled $false
-
-    Write-Host "Detaching PK disk '$attachPkDiskPath'..."
-    $postUpdateSnapshots = Get-Snapshot -VM $vm -ErrorAction SilentlyContinue
-    if ($postUpdateSnapshots) {
-        Write-Warning "Skipping PK disk detach because snapshot(s) exist. VMware does not allow removing a virtual disk that is part of a snapshot chain. Remove snapshot(s) first, then detach the PK disk."
-    }
-    else {
-        $pkDisk = @(Find-PkHardDisk -VM $vm -TargetDatastorePath $attachPkDiskPath)
-
-        if ($pkDisk.Count -eq 1) {
-            $pkDisk | Remove-HardDisk -Confirm:$false -DeletePermanently:$false | Out-Null
-        }
-        elseif ($pkDisk.Count -gt 1) {
-            $paths = ($pkDisk | ForEach-Object { if ($_.Filename) { $_.Filename } else { $_.FileName } }) -join ", "
-            Write-Warning "Multiple matching PK disks found: $paths. Remove manually to avoid detaching the wrong disk."
+        Write-Status "Attaching PK disk '$attachPkDiskPath'..."
+        $pkDiskExisting = @(Find-PkHardDisk -VM $vm -TargetDatastorePath $attachPkDiskPath)
+        if ($pkDiskExisting.Count -eq 0) {
+            New-HardDisk -VM $vm -DiskPath $attachPkDiskPath -Confirm:$false | Out-Null
         }
         else {
-            Write-Warning "PK disk not found by path. Remove manually if still attached."
+            Write-Status "PK disk already attached, continuing."
+        }
+
+        Write-Status "Creating snapshot '$($Target.SnapshotName)'..."
+        New-Snapshot -VM $vm -Name $Target.SnapshotName -Description "Pre Microsoft PK enrollment" -Memory:$false -Quiesce:$false | Out-Null
+        $script:snapshotCreatedAtUtc = (Get-Date).ToUniversalTime().ToString("o")
+        Write-RunLog -Status "snapshot_created" -SnapshotCreatedUtc $snapshotCreatedAtUtc -SnapshotNameValue $Target.SnapshotName
+
+        Write-Status "Setting uefi.allowAuthBypass=TRUE..."
+        Set-AuthBypass -VM $vm -Enabled $true
+
+        Write-Status "Forcing next boot into firmware setup..."
+        Set-EnterFirmwareSetup -VM $vm -Enabled $true
+
+        Write-Status "Powering on VM '$($Target.VMName)'..."
+        Ensure-PoweredOn -VM $vm
+
+        Write-Status "Running HID enrollment sequence..."
+        Invoke-HidSequence -VM $vm
+
+        Force-PoweredOff -VM $vm
+
+        Write-Status "Removing uefi.allowAuthBypass..."
+        Set-AuthBypass -VM $vm -Enabled $false
+
+        Write-Status "Clearing forced firmware setup flag..."
+        Set-EnterFirmwareSetup -VM $vm -Enabled $false
+
+        Write-Status "Detaching PK disk '$attachPkDiskPath'..."
+        $postUpdateSnapshots = Get-Snapshot -VM $vm -ErrorAction SilentlyContinue
+        if ($postUpdateSnapshots) {
+            Write-StatusWarning "Skipping PK disk detach because snapshot(s) exist. VMware does not allow removing a virtual disk that is part of a snapshot chain. Remove snapshot(s) first, then detach the PK disk."
+        }
+        else {
+            $pkDisk = @(Find-PkHardDisk -VM $vm -TargetDatastorePath $attachPkDiskPath)
+
+            if ($pkDisk.Count -eq 1) {
+                $pkDisk | Remove-HardDisk -Confirm:$false -DeletePermanently:$false | Out-Null
+            }
+            elseif ($pkDisk.Count -gt 1) {
+                $paths = ($pkDisk | ForEach-Object { if ($_.Filename) { $_.Filename } else { $_.FileName } }) -join ", "
+                Write-StatusWarning "Multiple matching PK disks found: $paths. Remove manually to avoid detaching the wrong disk."
+            }
+            else {
+                Write-StatusWarning "PK disk not found by path. Remove manually if still attached."
+            }
+        }
+
+        Write-Status "Powering on VM '$($Target.VMName)'..."
+        Ensure-PoweredOn -VM $vm
+
+        Set-PkFixedTag -VM $vm
+
+        $script:status = "success"
+        Write-Status "PK update workflow completed for VM '$($Target.VMName)'."
+        return [pscustomobject]@{
+            VMName = $Target.VMName
+            Status = $status
+            Error  = $null
+        }
+    }
+    catch {
+        $script:status = "failed"
+        $script:failureMessage = $_.Exception.Message
+        Write-StatusError "VM '$($Target.VMName)' failed: $failureMessage"
+        return [pscustomobject]@{
+            VMName = $Target.VMName
+            Status = $status
+            Error  = $failureMessage
+        }
+    }
+    finally {
+        if ($status -ne "aborted") {
+            Write-RunLog -Status $status -ErrorMessage $failureMessage -SnapshotCreatedUtc $snapshotCreatedAtUtc -SnapshotNameValue $Target.SnapshotName
+        }
+    }
+}
+
+$cred = Get-LoginCredential -User $Username -Pass $Password
+$targets = @(Get-TargetVmSpecs -SingleVMName $VMName -CsvFilePath $CsvPath)
+
+try {
+    $existingConnection = @(Get-ConnectedVIServer -ServerName $VCServer)
+    if ($existingConnection.Count -gt 0) {
+        $activeVIServerConnection = $existingConnection[0]
+        $VCServer = Get-VIServerName -Server $activeVIServerConnection
+        Write-Status "Using existing vCenter connection to '$VCServer'."
+        $Username = $null
+        $Password = $null
+        $cred = $null
+    }
+    else {
+        if (-not $VCServer) {
+            $existingConnection = @(Get-ConnectedVIServer)
+            if ($existingConnection.Count -eq 1) {
+                $activeVIServerConnection = $existingConnection[0]
+                $VCServer = Get-VIServerName -Server $activeVIServerConnection
+                Write-Status "Using existing vCenter connection to '$VCServer'."
+            }
+            elseif ($existingConnection.Count -gt 1) {
+                throw "Multiple vCenter connections are already open. Pass -VCServer to choose which one to use."
+            }
+            else {
+                throw "VCServer is required when no existing vCenter connection is available. Pass -VCServer or set VC_SERVER."
+            }
+        }
+
+        if ($cred) {
+            $activeVIServerConnection = Connect-VIServer -Server $VCServer -Credential $cred
+            $openedVIServerConnection = $true
+        }
+        elseif ($Username) {
+            try {
+                $activeVIServerConnection = Connect-VIServer -Server $VCServer -User $Username -ErrorAction Stop
+                $openedVIServerConnection = $true
+            }
+            catch {
+                throw "Unable to authenticate for '$Username' on '$VCServer'. Provide -Password, set VC_PASS, or save credentials in PowerCLI credential store."
+            }
+        }
+        else {
+            throw "No existing vCenter connection was found in this PowerShell process, and no credentials were provided. If you are starting the script with 'pwsh -NoProfile -File', pass -Username/-Password (or set VC_USER/VC_PASS), or run it from the same PowerShell session that already has an active Connect-VIServer connection."
         }
     }
 
-    Write-Host "Powering on VM '$VMName'..."
-    Ensure-PoweredOn -VM $vm
+    if (-not $activeVIServerConnection) {
+        throw "Unable to resolve an active vCenter connection for '$VCServer'."
+    }
 
-    $status = "success"
-    Write-Host "PK update workflow completed."
+    foreach ($target in $targets) {
+        Write-Status "Starting VM '$($target.VMName)'..."
+        $batchResults += @(Invoke-PkUpdateForVm -Target $target)
+    }
+
+    $failedTargets = @($batchResults | Where-Object { $_.Status -eq "failed" })
+    $abortedTargets = @($batchResults | Where-Object { $_.Status -eq "aborted" })
+    $successfulTargets = @($batchResults | Where-Object { $_.Status -eq "success" })
+
+    Write-Status "Batch summary: $($successfulTargets.Count) succeeded, $($abortedTargets.Count) aborted, $($failedTargets.Count) failed."
+
+    if ($failedTargets.Count -gt 0 -or $abortedTargets.Count -gt 0) {
+        $failedNames = @($failedTargets + $abortedTargets | Select-Object -ExpandProperty VMName)
+        throw "One or more VM operations did not complete successfully: $($failedNames -join ', ')"
+    }
 }
 catch {
     $status = "failed"
     $failureMessage = $_.Exception.Message
+    Write-StatusError $failureMessage
     throw
 }
 finally {
-    if ($status -ne "aborted") {
-        Write-RunLog -Status $status -ErrorMessage $failureMessage -SnapshotCreatedUtc $snapshotCreatedAtUtc -SnapshotNameValue $SnapshotName
-    }
-
-    $connected = @()
-    $viServersVar = Get-Variable -Name DefaultVIServers -Scope Global -ErrorAction SilentlyContinue
-    if ($viServersVar -and $viServersVar.Value) {
-        $connected = @($viServersVar.Value | Where-Object { $_.Name -eq $VCServer })
-    }
-
-    if ($connected) {
-        Disconnect-VIServer -Server $VCServer -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+    if ($openedVIServerConnection -and $activeVIServerConnection) {
+        Disconnect-VIServer -Server $activeVIServerConnection -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
     }
 }
