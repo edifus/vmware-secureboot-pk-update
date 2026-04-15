@@ -31,14 +31,11 @@ The script then classifies each device into one of these buckets:
 - CheckFailed: the validation could not be completed remotely
 
 .PARAMETER SearchBase
-The distinguished name of the Active Directory OU to search for Windows
-computer objects.
+The distinguished name of the Active Directory OU to search for Windows computer objects.
 
 .PARAMETER ExportCsv
-When specified, exports CSV reports for all results and each result bucket.
-
-.PARAMETER OutputDirectory
-Directory where CSV reports are written when -ExportCsv is specified.
+When specified, exports a single CSV report containing the simplified device
+status results.
 
 .EXAMPLE
 pwsh -NoProfile -File ./Check-AdPkStatus.ps1 -SearchBase "OU=Servers,DC=example,DC=com"
@@ -58,10 +55,7 @@ param(
     [string]$SearchBase,
 
     [Parameter(Mandatory = $false)]
-    [switch]$ExportCsv,
-
-    [Parameter(Mandatory = $false)]
-    [string]$OutputDirectory = "."
+    [switch]$ExportCsv
 )
 
 Set-StrictMode -Version Latest
@@ -93,51 +87,26 @@ function Write-ResultTable {
     }
 
     $table = $Items |
-        Select-Object ComputerName, Status, PkValid, HasRequiredKek2023, HasEvent1801, Detail |
+        Select-Object ComputerName, DnsHostName, Status, ReadyForVmPkUpdate, Detail |
         Format-Table -AutoSize |
         Out-String
 
     Write-Host $table.TrimEnd()
 }
 
-function Export-PkStatusReports {
+function Export-PkStatusReport {
     param(
         [Parameter(Mandatory = $true)]
-        [object[]]$AllResults,
-
-        [Parameter(Mandatory = $true)]
-        [string]$DirectoryPath
+        [object[]]$AllResults
     )
 
     $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
-    $resolvedOutputPath = Resolve-Path -Path $DirectoryPath -ErrorAction SilentlyContinue
-    if (-not $resolvedOutputPath) {
-        $null = New-Item -Path $DirectoryPath -ItemType Directory -Force
-        $resolvedOutputPath = Resolve-Path -Path $DirectoryPath -ErrorAction Stop
-    }
+    $reportPath = Join-Path -Path (Get-Location) -ChildPath "pk-status-$timestamp.csv"
 
-    $fileMap = [ordered]@{
-        "All results"                     = Join-Path -Path $resolvedOutputPath -ChildPath "pk-status-all-$timestamp.csv"
-        "Needs VM PK remediation ready"   = Join-Path -Path $resolvedOutputPath -ChildPath "pk-status-needs-vm-pk-remediation-ready-$timestamp.csv"
-        "Needs VM PK remediation waiting" = Join-Path -Path $resolvedOutputPath -ChildPath "pk-status-needs-vm-pk-remediation-not-ready-$timestamp.csv"
-        "Needs Microsoft KEK update"      = Join-Path -Path $resolvedOutputPath -ChildPath "pk-status-needs-microsoft-kek-update-$timestamp.csv"
-        "Healthy"                         = Join-Path -Path $resolvedOutputPath -ChildPath "pk-status-healthy-$timestamp.csv"
-        "Review manually"                 = Join-Path -Path $resolvedOutputPath -ChildPath "pk-status-review-manually-$timestamp.csv"
-        "Check failed"                    = Join-Path -Path $resolvedOutputPath -ChildPath "pk-status-check-failed-$timestamp.csv"
-    }
-
-    $AllResults | Export-Csv -Path $fileMap["All results"] -NoTypeInformation
-    $AllResults | Where-Object { $_.Status -eq "NeedsVmPkRemediationAndReady" } | Export-Csv -Path $fileMap["Needs VM PK remediation ready"] -NoTypeInformation
-    $AllResults | Where-Object { $_.Status -eq "NeedsVmPkRemediationNotReady" } | Export-Csv -Path $fileMap["Needs VM PK remediation waiting"] -NoTypeInformation
-    $AllResults | Where-Object { $_.Status -eq "NeedsMicrosoftKekUpdate" } | Export-Csv -Path $fileMap["Needs Microsoft KEK update"] -NoTypeInformation
-    $AllResults | Where-Object { $_.Status -eq "Healthy" } | Export-Csv -Path $fileMap["Healthy"] -NoTypeInformation
-    $AllResults | Where-Object { $_.Status -eq "ReviewManually" } | Export-Csv -Path $fileMap["Review manually"] -NoTypeInformation
-    $AllResults | Where-Object { $_.Status -eq "CheckFailed" } | Export-Csv -Path $fileMap["Check failed"] -NoTypeInformation
+    $AllResults | Export-Csv -Path $reportPath -NoTypeInformation
 
     Write-SectionHeader -Title "CSV Export" -Color Green
-    foreach ($entry in $fileMap.GetEnumerator()) {
-        Write-Host ("{0,-27} {1}" -f ($entry.Key + ":"), $entry.Value)
-    }
+    Write-Host "Report: $reportPath"
 }
 
 function Get-DeviceStatus {
@@ -355,46 +324,18 @@ foreach ($computer in $windowsComputers) {
         $results += [PSCustomObject]@{
             ComputerName       = $computer.Name
             DnsHostName        = $computer.DNSHostName
-            OperatingSystem    = $computer.OperatingSystem
             Status             = $deviceStatus.Status
             Detail             = $deviceStatus.Detail
             ReadyForVmPkUpdate = ($deviceStatus.Status -eq "NeedsVmPkRemediationAndReady")
-            PkValid            = $remoteResult.PkValid
-            PkDetail           = $remoteResult.PkDetail
-            PkByteLength       = $remoteResult.PkByteLength
-            PkCertByteLength   = $remoteResult.PkCertByteLength
-            PkCertutilOutput   = $remoteResult.PkCertutilOutput
-            HasRequiredKek2023 = $remoteResult.HasRequiredKek2023
-            KekDetail          = $remoteResult.KekDetail
-            KekByteLength      = $remoteResult.KekByteLength
-            HasEvent1801       = $remoteResult.HasEvent1801
-            Event1801Detail    = $remoteResult.Event1801Detail
-            Event1801TimeUtc   = $remoteResult.Event1801TimeUtc
-            Event1801Message   = $remoteResult.Event1801Message
-            CheckedAtUtc       = (Get-Date).ToUniversalTime().ToString("o")
         }
     }
     catch {
         $results += [PSCustomObject]@{
             ComputerName       = $computer.Name
             DnsHostName        = $computer.DNSHostName
-            OperatingSystem    = $computer.OperatingSystem
             Status             = "CheckFailed"
             Detail             = $_.Exception.Message
             ReadyForVmPkUpdate = $false
-            PkValid            = $false
-            PkDetail           = $null
-            PkByteLength       = $null
-            PkCertByteLength   = $null
-            PkCertutilOutput   = $null
-            HasRequiredKek2023 = $false
-            KekDetail          = $null
-            KekByteLength      = $null
-            HasEvent1801       = $false
-            Event1801Detail    = $null
-            Event1801TimeUtc   = $null
-            Event1801Message   = $null
-            CheckedAtUtc       = (Get-Date).ToUniversalTime().ToString("o")
         }
     }
 }
@@ -405,7 +346,7 @@ $needsMicrosoftKekUpdateDevices = @($results | Where-Object { $_.Status -eq "Nee
 $healthyDevices = @($results | Where-Object { $_.Status -eq "Healthy" })
 $reviewManuallyDevices = @($results | Where-Object { $_.Status -eq "ReviewManually" })
 $checkFailedDevices = @($results | Where-Object { $_.Status -eq "CheckFailed" })
-$event1801Devices = @($results | Where-Object { $_.HasEvent1801 })
+$readyForVmPkUpdateDevices = @($results | Where-Object { $_.ReadyForVmPkUpdate })
 
 Write-SectionHeader -Title "Summary" -Color Green
 Write-Host "Windows computers checked:      $($results.Count)"
@@ -415,7 +356,7 @@ Write-Host "Needs Microsoft KEK update:     $($needsMicrosoftKekUpdateDevices.Co
 Write-Host "Healthy:                        $($healthyDevices.Count)"
 Write-Host "Review manually:                $($reviewManuallyDevices.Count)"
 Write-Host "Check failed:                   $($checkFailedDevices.Count)"
-Write-Host "Event ID 1801 present:          $($event1801Devices.Count)"
+Write-Host "Ready for VM PK update:         $($readyForVmPkUpdateDevices.Count)"
 
 Write-SectionHeader -Title "Needs VM PK Remediation And Ready" -Color Red
 Write-ResultTable -Items $needsVmPkRemediationReadyDevices
@@ -436,5 +377,5 @@ Write-SectionHeader -Title "Validation Failures" -Color Yellow
 Write-ResultTable -Items $checkFailedDevices
 
 if ($ExportCsv) {
-    Export-PkStatusReports -AllResults $results -DirectoryPath $OutputDirectory
+    Export-PkStatusReport -AllResults $results
 }
