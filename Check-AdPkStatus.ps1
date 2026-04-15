@@ -91,7 +91,7 @@ function Write-ResultTable {
     }
 
     $table = $Items |
-        Select-Object ComputerName, DnsHostName, Status, ReadyForVmPkUpdate, SecureBootEnabled, UefiCa2023Status, Detail |
+        Select-Object ComputerName, DnsHostName, Status, ReadyForVmPkUpdate, SecureBootEnabled, ServicingComplete, UefiCa2023Status, Detail |
         Format-Table -AutoSize |
         Out-String
 
@@ -141,8 +141,9 @@ function Get-DeviceStatus {
 
     if ($null -eq $SecureBootEnabled -or -not [bool]$SecureBootEnabled) {
         return [PSCustomObject]@{
-            Status = "SecureBootDisabledOrUnsupported"
-            Detail = "Secure Boot is disabled or could not be confirmed on this system."
+            Status             = "SecureBootDisabledOrUnsupported"
+            Detail             = "Secure Boot is disabled or could not be confirmed on this system."
+            ServicingComplete  = $false
         }
     }
 
@@ -154,8 +155,9 @@ function Get-DeviceStatus {
             }
 
             return [PSCustomObject]@{
-                Status = "NeedsVmPkRemediationAndReady"
-                Detail = $detail
+                Status            = "NeedsVmPkRemediationAndReady"
+                Detail            = $detail
+                ServicingComplete = $false
             }
         }
 
@@ -165,16 +167,18 @@ function Get-DeviceStatus {
         }
 
         return [PSCustomObject]@{
-            Status = "NeedsVmPkRemediationNotReady"
-            Detail = $detail
+            Status            = "NeedsVmPkRemediationNotReady"
+            Detail            = $detail
+            ServicingComplete = $false
         }
     }
 
     if ($PkValid -and -not $HasRequiredKek2023) {
         if ($UefiCa2023Status -eq "InProgress") {
             return [PSCustomObject]@{
-                Status = "UpdateInProgress"
-                Detail = "PK is valid, KEK 2023 is still missing, and Windows Secure Boot servicing is in progress."
+                Status            = "UpdateInProgress"
+                Detail            = "PK is valid, KEK 2023 is still missing, and Windows Secure Boot servicing is in progress."
+                ServicingComplete = $false
             }
         }
 
@@ -185,8 +189,9 @@ function Get-DeviceStatus {
             }
 
             return [PSCustomObject]@{
-                Status = "ReviewManually"
-                Detail = $detail
+                Status            = "ReviewManually"
+                Detail            = $detail
+                ServicingComplete = $false
             }
         }
 
@@ -196,20 +201,19 @@ function Get-DeviceStatus {
         }
 
         return [PSCustomObject]@{
-            Status = "NeedsMicrosoftKekUpdate"
-            Detail = $detail
+            Status            = "NeedsMicrosoftKekUpdate"
+            Detail            = $detail
+            ServicingComplete = $false
         }
     }
 
     if ($PkValid -and $HasRequiredKek2023) {
-        $detail = "PK is valid and Microsoft Corporation KEK 2K CA 2023 is present."
-        if ($UefiCa2023Status -eq "Updated" -or $HasEvent1808) {
-            $detail = "PK is valid, Microsoft Corporation KEK 2K CA 2023 is present, and Windows Secure Boot servicing reports completion."
-        }
+        $servicingComplete = ($UefiCa2023Status -eq "Updated" -or $HasEvent1808)
 
         return [PSCustomObject]@{
-            Status = "Healthy"
-            Detail = $detail
+            Status            = "Healthy"
+            Detail            = "Secure Boot certificates appear healthy."
+            ServicingComplete = $servicingComplete
         }
     }
 
@@ -219,8 +223,9 @@ function Get-DeviceStatus {
     }
 
     return [PSCustomObject]@{
-        Status = "ReviewManually"
-        Detail = $detail
+        Status            = "ReviewManually"
+        Detail            = $detail
+        ServicingComplete = $false
     }
 }
 
@@ -407,6 +412,7 @@ foreach ($computer in $windowsComputers) {
             Detail             = $deviceStatus.Detail
             ReadyForVmPkUpdate = ($deviceStatus.Status -eq "NeedsVmPkRemediationAndReady")
             SecureBootEnabled  = $remoteResult.SecureBootEnabled
+            ServicingComplete  = $deviceStatus.ServicingComplete
             UefiCa2023Status   = $remoteResult.UefiCa2023Status
         }
     }
@@ -418,6 +424,7 @@ foreach ($computer in $windowsComputers) {
             Detail             = $_.Exception.Message
             ReadyForVmPkUpdate = $false
             SecureBootEnabled  = $null
+            ServicingComplete  = $false
             UefiCa2023Status   = $null
         }
     }
