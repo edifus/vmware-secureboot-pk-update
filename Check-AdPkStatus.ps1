@@ -18,13 +18,18 @@ The remote validation performs two checks:
    - Get-SecureBootUEFI -Name KEK
    - Convert the KEK byte array to ASCII text
    - Check for "Microsoft Corporation KEK 2K CA 2023"
-3. Event log readiness check:
+3. Secure Boot servicing state validation:
+   - Confirm whether Secure Boot is enabled
+   - Read UEFICA2023Status and UEFICA2023Error from the Secure Boot servicing registry key
+4. Event log readiness check:
    - Query the System event log for TPM-WMI Event ID 1801
-   - Record whether the event is present and capture the latest timestamp
+   - Query the System event log for TPM-WMI Event ID 1808
 
 The script then classifies each device into one of these buckets:
+- SecureBootDisabledOrUnsupported: Secure Boot is disabled or unavailable on the system
 - NeedsVmPkRemediationAndReady: PK is invalid, KEK 2023 is missing, and Event ID 1801 is present
 - NeedsVmPkRemediationNotReady: PK is invalid, KEK 2023 is missing, and Event ID 1801 is not present
+- UpdateInProgress: Windows Secure Boot servicing appears to be actively progressing
 - NeedsMicrosoftKekUpdate: PK is valid but KEK 2023 is missing
 - Healthy: PK is valid and KEK 2023 is present
 - ReviewManually: PK is invalid but KEK 2023 is present
@@ -61,25 +66,24 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-function Write-SectionHeader {
+function Write-ResultTable {
     param(
-        [Parameter(Mandatory = $true)]
+        [Parameter(Mandatory = $false)]
         [string]$Title,
 
         [Parameter(Mandatory = $false)]
-        [ConsoleColor]$Color = [ConsoleColor]::Cyan
-    )
+        [ConsoleColor]$Color = [ConsoleColor]::Cyan,
 
-    Write-Host ""
-    Write-Host $Title -ForegroundColor $Color
-    Write-Host ("-" * $Title.Length) -ForegroundColor $Color
-}
-
-function Write-ResultTable {
-    param(
         [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
         [object[]]$Items
     )
+
+    if ($Title) {
+        Write-Host ""
+        Write-Host $Title -ForegroundColor $Color
+        Write-Host ("-" * $Title.Length) -ForegroundColor $Color
+    }
 
     if ($Items.Count -eq 0) {
         Write-Host "None"
@@ -87,7 +91,7 @@ function Write-ResultTable {
     }
 
     $table = $Items |
-        Select-Object ComputerName, DnsHostName, Status, ReadyForVmPkUpdate, Detail |
+        Select-Object ComputerName, DnsHostName, Status, ReadyForVmPkUpdate, SecureBootEnabled, UefiCa2023Status, Detail |
         Format-Table -AutoSize |
         Out-String
 
@@ -105,12 +109,17 @@ function Export-PkStatusReport {
 
     $AllResults | Export-Csv -Path $reportPath -NoTypeInformation
 
-    Write-SectionHeader -Title "CSV Export" -Color Green
+    Write-Host ""
+    Write-Host "CSV Export" -ForegroundColor Green
+    Write-Host ("-" * "CSV Export".Length) -ForegroundColor Green
     Write-Host "Report: $reportPath"
 }
 
 function Get-DeviceStatus {
     param(
+        [Parameter(Mandatory = $true)]
+        $SecureBootEnabled,
+
         [Parameter(Mandatory = $true)]
         [bool]$PkValid,
 
@@ -118,40 +127,100 @@ function Get-DeviceStatus {
         [bool]$HasRequiredKek2023,
 
         [Parameter(Mandatory = $true)]
-        [bool]$HasEvent1801
+        [bool]$HasEvent1801,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$HasEvent1808,
+
+        [Parameter(Mandatory = $false)]
+        [string]$UefiCa2023Status,
+
+        [Parameter(Mandatory = $false)]
+        [string]$UefiCa2023Error
     )
+
+    if ($null -eq $SecureBootEnabled -or -not [bool]$SecureBootEnabled) {
+        return [PSCustomObject]@{
+            Status = "SecureBootDisabledOrUnsupported"
+            Detail = "Secure Boot is disabled or could not be confirmed on this system."
+        }
+    }
 
     if (-not $PkValid -and -not $HasRequiredKek2023) {
         if ($HasEvent1801) {
+            $detail = "PK is invalid, Microsoft Corporation KEK 2K CA 2023 is missing, and Event ID 1801 shows the OS is ready for the manual VMware PK update."
+            if ($UefiCa2023Error) {
+                $detail = "$detail UEFICA2023Error: $UefiCa2023Error"
+            }
+
             return [PSCustomObject]@{
                 Status = "NeedsVmPkRemediationAndReady"
-                Detail = "PK is invalid, Microsoft Corporation KEK 2K CA 2023 is missing, and Event ID 1801 shows the OS is ready for the manual VMware PK update."
+                Detail = $detail
             }
+        }
+
+        $detail = "PK is invalid and Microsoft Corporation KEK 2K CA 2023 is missing, but Event ID 1801 was not found."
+        if ($UefiCa2023Error) {
+            $detail = "$detail UEFICA2023Error: $UefiCa2023Error"
         }
 
         return [PSCustomObject]@{
             Status = "NeedsVmPkRemediationNotReady"
-            Detail = "PK is invalid and Microsoft Corporation KEK 2K CA 2023 is missing, but Event ID 1801 was not found."
+            Detail = $detail
         }
     }
 
     if ($PkValid -and -not $HasRequiredKek2023) {
+        if ($UefiCa2023Status -eq "InProgress") {
+            return [PSCustomObject]@{
+                Status = "UpdateInProgress"
+                Detail = "PK is valid, KEK 2023 is still missing, and Windows Secure Boot servicing is in progress."
+            }
+        }
+
+        if ($UefiCa2023Status -eq "Updated" -or $HasEvent1808) {
+            $detail = "Windows reports Secure Boot servicing completed, but the KEK 2023 certificate is still missing."
+            if ($UefiCa2023Error) {
+                $detail = "$detail UEFICA2023Error: $UefiCa2023Error"
+            }
+
+            return [PSCustomObject]@{
+                Status = "ReviewManually"
+                Detail = $detail
+            }
+        }
+
+        $detail = "PK is valid, but Microsoft Corporation KEK 2K CA 2023 is missing."
+        if ($UefiCa2023Error) {
+            $detail = "$detail UEFICA2023Error: $UefiCa2023Error"
+        }
+
         return [PSCustomObject]@{
             Status = "NeedsMicrosoftKekUpdate"
-            Detail = "PK is valid, but Microsoft Corporation KEK 2K CA 2023 is missing."
+            Detail = $detail
         }
     }
 
     if ($PkValid -and $HasRequiredKek2023) {
+        $detail = "PK is valid and Microsoft Corporation KEK 2K CA 2023 is present."
+        if ($UefiCa2023Status -eq "Updated" -or $HasEvent1808) {
+            $detail = "PK is valid, Microsoft Corporation KEK 2K CA 2023 is present, and Windows Secure Boot servicing reports completion."
+        }
+
         return [PSCustomObject]@{
             Status = "Healthy"
-            Detail = "PK is valid and Microsoft Corporation KEK 2K CA 2023 is present."
+            Detail = $detail
         }
+    }
+
+    $detail = "PK appears invalid, but Microsoft Corporation KEK 2K CA 2023 is present. Review this combination manually."
+    if ($UefiCa2023Error) {
+        $detail = "$detail UEFICA2023Error: $UefiCa2023Error"
     }
 
     return [PSCustomObject]@{
         Status = "ReviewManually"
-        Detail = "PK appears invalid, but Microsoft Corporation KEK 2K CA 2023 is present. Review this combination manually."
+        Detail = $detail
     }
 }
 
@@ -178,27 +247,26 @@ $validationScript = {
     $pkDerPath = Join-Path -Path $env:TEMP -ChildPath ("PK-{0}.der" -f ([Guid]::NewGuid().ToString("N")))
 
     try {
+        $secureBootEnabled = $null
+        try {
+            $secureBootEnabled = Confirm-SecureBootUEFI -ErrorAction Stop
+        }
+        catch {
+            try {
+                $secureBootState = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\State" -Name UEFISecureBootEnabled -ErrorAction Stop
+                $secureBootEnabled = [bool]$secureBootState.UEFISecureBootEnabled
+            }
+            catch {
+                $secureBootEnabled = $null
+            }
+        }
+
         $pkObject = Get-SecureBootUEFI -Name PK -ErrorAction Stop
         $pkBytes = $pkObject.Bytes
-        $pkByteLength = $null
-        if ($null -ne $pkBytes) {
-            $pkByteLength = $pkBytes.Length
-        }
-        $pkCertByteLength = $null
-        $pkCertutilOutput = $null
         $pkValid = $false
-        $pkDetail = $null
 
-        if ($null -eq $pkBytes) {
-            $pkDetail = "Get-SecureBootUEFI returned null PK bytes."
-        }
-        elseif ($pkBytes.Length -le 44) {
-            $pkDetail = "PK byte array is too short to contain a certificate payload."
-            $pkCertByteLength = 0
-        }
-        else {
+        if ($null -ne $pkBytes -and $pkBytes.Length -gt 44) {
             $pkCertBytes = [byte[]]$pkBytes[44..($pkBytes.Length - 1)]
-            $pkCertByteLength = $pkCertBytes.Length
             [System.IO.File]::WriteAllBytes($pkDerPath, $pkCertBytes)
 
             $certutilOutputLines = @(
@@ -222,43 +290,18 @@ $validationScript = {
                 $certificateParsed = $false
             }
 
-            if ($hasBroadcomZeroPayload) {
-                $pkDetail = "Broadcom invalid PK pattern detected: 00 payload / 45-byte PK structure."
-            }
-            elseif ($certutilExitCode -ne 0) {
-                $pkDetail = "certutil -dump failed for extracted PK certificate."
-            }
-            elseif (-not $certificateParsed) {
-                $pkDetail = "Extracted PK certificate could not be parsed as X.509."
-            }
-            else {
+            if (-not $hasBroadcomZeroPayload -and $certutilExitCode -eq 0 -and $certificateParsed) {
                 $pkValid = $true
-                $pkDetail = "PK certificate extracted and parsed successfully."
             }
         }
 
         $kekObject = Get-SecureBootUEFI -Name KEK -ErrorAction Stop
         $kekBytes = $kekObject.Bytes
-        $kekByteLength = $null
-        if ($null -ne $kekBytes) {
-            $kekByteLength = $kekBytes.Length
-        }
         $hasRequiredKek2023 = $false
-        $kekDetail = $null
 
-        if ($null -eq $kekBytes) {
-            $kekDetail = "Get-SecureBootUEFI returned null KEK bytes."
-        }
-        else {
+        if ($null -ne $kekBytes) {
             $kekText = [System.Text.Encoding]::ASCII.GetString($kekBytes)
             $hasRequiredKek2023 = $kekText -match 'Microsoft Corporation KEK 2K CA 2023'
-
-            if ($hasRequiredKek2023) {
-                $kekDetail = "Microsoft Corporation KEK 2K CA 2023 is present."
-            }
-            else {
-                $kekDetail = "Microsoft Corporation KEK 2K CA 2023 was not found."
-            }
         }
 
         $event1801 = Get-WinEvent -FilterHashtable @{
@@ -268,32 +311,41 @@ $validationScript = {
         } -MaxEvents 1 -ErrorAction SilentlyContinue
 
         $hasEvent1801 = $null -ne $event1801
-        $event1801TimeCreatedUtc = $null
-        $event1801Message = $null
-        $event1801Detail = $null
 
-        if ($hasEvent1801) {
-            $event1801TimeCreatedUtc = $event1801.TimeCreated.ToUniversalTime().ToString("o")
-            $event1801Message = $event1801.Message
-            $event1801Detail = "TPM-WMI Event ID 1801 is present."
+        $event1808 = Get-WinEvent -FilterHashtable @{
+            LogName      = "System"
+            ProviderName = "TPM-WMI"
+            Id           = 1808
+        } -MaxEvents 1 -ErrorAction SilentlyContinue
+
+        $hasEvent1808 = $null -ne $event1808
+
+        $uefiCa2023Status = $null
+        try {
+            $secureBootServicing = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\Servicing" -Name UEFICA2023Status -ErrorAction Stop
+            $uefiCa2023Status = [string]$secureBootServicing.UEFICA2023Status
         }
-        else {
-            $event1801Detail = "TPM-WMI Event ID 1801 was not found."
+        catch {
+            $uefiCa2023Status = $null
+        }
+
+        $uefiCa2023Error = $null
+        try {
+            $secureBootServicing = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\Servicing" -Name UEFICA2023Error -ErrorAction Stop
+            $uefiCa2023Error = [string]$secureBootServicing.UEFICA2023Error
+        }
+        catch {
+            $uefiCa2023Error = $null
         }
 
         return [PSCustomObject]@{
+            SecureBootEnabled  = $secureBootEnabled
             PkValid            = $pkValid
-            PkDetail           = $pkDetail
-            PkByteLength       = $pkByteLength
-            PkCertByteLength   = $pkCertByteLength
-            PkCertutilOutput   = $pkCertutilOutput
             HasRequiredKek2023 = $hasRequiredKek2023
-            KekDetail          = $kekDetail
-            KekByteLength      = $kekByteLength
             HasEvent1801       = $hasEvent1801
-            Event1801Detail    = $event1801Detail
-            Event1801TimeUtc   = $event1801TimeCreatedUtc
-            Event1801Message   = $event1801Message
+            HasEvent1808       = $hasEvent1808
+            UefiCa2023Status   = $uefiCa2023Status
+            UefiCa2023Error    = $uefiCa2023Error
         }
     }
     finally {
@@ -319,7 +371,14 @@ foreach ($computer in $windowsComputers) {
         }
 
         $remoteResult = Invoke-Command @invokeCommandParameters
-        $deviceStatus = Get-DeviceStatus -PkValid $remoteResult.PkValid -HasRequiredKek2023 $remoteResult.HasRequiredKek2023 -HasEvent1801 $remoteResult.HasEvent1801
+        $deviceStatus = Get-DeviceStatus `
+            -SecureBootEnabled $remoteResult.SecureBootEnabled `
+            -PkValid $remoteResult.PkValid `
+            -HasRequiredKek2023 $remoteResult.HasRequiredKek2023 `
+            -HasEvent1801 $remoteResult.HasEvent1801 `
+            -HasEvent1808 $remoteResult.HasEvent1808 `
+            -UefiCa2023Status $remoteResult.UefiCa2023Status `
+            -UefiCa2023Error $remoteResult.UefiCa2023Error
 
         $results += [PSCustomObject]@{
             ComputerName       = $computer.Name
@@ -327,6 +386,8 @@ foreach ($computer in $windowsComputers) {
             Status             = $deviceStatus.Status
             Detail             = $deviceStatus.Detail
             ReadyForVmPkUpdate = ($deviceStatus.Status -eq "NeedsVmPkRemediationAndReady")
+            SecureBootEnabled  = $remoteResult.SecureBootEnabled
+            UefiCa2023Status   = $remoteResult.UefiCa2023Status
         }
     }
     catch {
@@ -336,45 +397,44 @@ foreach ($computer in $windowsComputers) {
             Status             = "CheckFailed"
             Detail             = $_.Exception.Message
             ReadyForVmPkUpdate = $false
+            SecureBootEnabled  = $null
+            UefiCa2023Status   = $null
         }
     }
 }
 
+$secureBootDisabledDevices = @($results | Where-Object { $_.Status -eq "SecureBootDisabledOrUnsupported" })
 $needsVmPkRemediationReadyDevices = @($results | Where-Object { $_.Status -eq "NeedsVmPkRemediationAndReady" })
 $needsVmPkRemediationNotReadyDevices = @($results | Where-Object { $_.Status -eq "NeedsVmPkRemediationNotReady" })
+$updateInProgressDevices = @($results | Where-Object { $_.Status -eq "UpdateInProgress" })
 $needsMicrosoftKekUpdateDevices = @($results | Where-Object { $_.Status -eq "NeedsMicrosoftKekUpdate" })
 $healthyDevices = @($results | Where-Object { $_.Status -eq "Healthy" })
 $reviewManuallyDevices = @($results | Where-Object { $_.Status -eq "ReviewManually" })
 $checkFailedDevices = @($results | Where-Object { $_.Status -eq "CheckFailed" })
 $readyForVmPkUpdateDevices = @($results | Where-Object { $_.ReadyForVmPkUpdate })
 
-Write-SectionHeader -Title "Summary" -Color Green
+Write-Host ""
+Write-Host "Summary" -ForegroundColor Green
+Write-Host ("-" * "Summary".Length) -ForegroundColor Green
 Write-Host "Windows computers checked:      $($results.Count)"
+Write-Host "Secure Boot off/unknown:        $($secureBootDisabledDevices.Count)"
 Write-Host "Needs VM PK remediation ready:  $($needsVmPkRemediationReadyDevices.Count)"
 Write-Host "Needs VM PK remediation wait:   $($needsVmPkRemediationNotReadyDevices.Count)"
+Write-Host "Update in progress:             $($updateInProgressDevices.Count)"
 Write-Host "Needs Microsoft KEK update:     $($needsMicrosoftKekUpdateDevices.Count)"
 Write-Host "Healthy:                        $($healthyDevices.Count)"
 Write-Host "Review manually:                $($reviewManuallyDevices.Count)"
 Write-Host "Check failed:                   $($checkFailedDevices.Count)"
 Write-Host "Ready for VM PK update:         $($readyForVmPkUpdateDevices.Count)"
 
-Write-SectionHeader -Title "Needs VM PK Remediation And Ready" -Color Red
-Write-ResultTable -Items $needsVmPkRemediationReadyDevices
-
-Write-SectionHeader -Title "Needs VM PK Remediation But Not Ready" -Color Yellow
-Write-ResultTable -Items $needsVmPkRemediationNotReadyDevices
-
-Write-SectionHeader -Title "Needs Microsoft KEK Update" -Color Yellow
-Write-ResultTable -Items $needsMicrosoftKekUpdateDevices
-
-Write-SectionHeader -Title "Healthy Devices" -Color Green
-Write-ResultTable -Items $healthyDevices
-
-Write-SectionHeader -Title "Review Manually" -Color Magenta
-Write-ResultTable -Items $reviewManuallyDevices
-
-Write-SectionHeader -Title "Validation Failures" -Color Yellow
-Write-ResultTable -Items $checkFailedDevices
+Write-ResultTable -Title "Secure Boot Disabled Or Unsupported" -Color Yellow -Items $secureBootDisabledDevices
+Write-ResultTable -Title "Needs VM PK Remediation And Ready" -Color Red -Items $needsVmPkRemediationReadyDevices
+Write-ResultTable -Title "Needs VM PK Remediation But Not Ready" -Color Yellow -Items $needsVmPkRemediationNotReadyDevices
+Write-ResultTable -Title "Update In Progress" -Color Cyan -Items $updateInProgressDevices
+Write-ResultTable -Title "Needs Microsoft KEK Update" -Color Yellow -Items $needsMicrosoftKekUpdateDevices
+Write-ResultTable -Title "Healthy Devices" -Color Green -Items $healthyDevices
+Write-ResultTable -Title "Review Manually" -Color Magenta -Items $reviewManuallyDevices
+Write-ResultTable -Title "Validation Failures" -Color Yellow -Items $checkFailedDevices
 
 if ($ExportCsv) {
     Export-PkStatusReport -AllResults $results
