@@ -139,11 +139,40 @@ function Get-DeviceStatus {
         [string]$UefiCa2023Error
     )
 
-    if ($null -eq $SecureBootEnabled -or -not [bool]$SecureBootEnabled) {
+    $hasSecureBootEvidence = (
+        $PkValid -or
+        $HasRequiredKek2023 -or
+        $HasEvent1801 -or
+        $HasEvent1808 -or
+        -not [string]::IsNullOrWhiteSpace($UefiCa2023Status)
+    )
+
+    if ($SecureBootEnabled -eq $false) {
         return [PSCustomObject]@{
             Status             = "SecureBootDisabledOrUnsupported"
             Detail             = "Secure Boot is disabled or could not be confirmed on this system."
             ServicingComplete  = $false
+        }
+    }
+
+    if ($null -eq $SecureBootEnabled -and -not $hasSecureBootEvidence) {
+        return [PSCustomObject]@{
+            Status             = "SecureBootDisabledOrUnsupported"
+            Detail             = "Secure Boot could not be confirmed and no Secure Boot servicing evidence was found."
+            ServicingComplete  = $false
+        }
+    }
+
+    if ($null -eq $SecureBootEnabled -and $HasEvent1801 -and -not $HasEvent1808) {
+        $detail = "Secure Boot could not be confirmed via cmdlet or registry, but Event ID 1801 indicates Windows attempted the update and is ready for the manual VMware PK update."
+        if ($UefiCa2023Error) {
+            $detail = "$detail UEFICA2023Error: $UefiCa2023Error"
+        }
+
+        return [PSCustomObject]@{
+            Status            = "NeedsVmPkRemediationAndReady"
+            Detail            = $detail
+            ServicingComplete = $false
         }
     }
 
@@ -251,11 +280,7 @@ $validationScript = {
         try {
             $secureBootEnabled = Confirm-SecureBootUEFI -ErrorAction Stop
         }
-        catch {
-            if ($_.Exception.Message -match 'not support on this platform|0xc0000002') {
-                $secureBootEnabled = $false
-            }
-        }
+        catch { }
 
         if ($null -eq $secureBootEnabled) {
             $secureBootState = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\State" -Name "UEFISecureBootEnabled" -ErrorAction SilentlyContinue
@@ -271,11 +296,7 @@ $validationScript = {
             try {
                 $pkObject = Get-SecureBootUEFI -Name PK -ErrorAction Stop
             }
-            catch {
-                if ($_.Exception.Message -match 'not support on this platform|0xc0000002') {
-                    $secureBootEnabled = $false
-                }
-            }
+            catch { }
 
             $pkBytes = $null
             if ($null -ne $pkObject) {
@@ -322,11 +343,7 @@ $validationScript = {
             try {
                 $kekObject = Get-SecureBootUEFI -Name KEK -ErrorAction Stop
             }
-            catch {
-                if ($_.Exception.Message -match 'not support on this platform|0xc0000002') {
-                    $secureBootEnabled = $false
-                }
-            }
+            catch { }
 
             $kekBytes = $null
             if ($null -ne $kekObject) {
