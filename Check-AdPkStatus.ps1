@@ -236,106 +236,99 @@ if ($windowsComputers.Count -eq 0) {
 }
 
 $validationScript = {
-    if (-not (Get-Command Get-SecureBootUEFI -ErrorAction SilentlyContinue)) {
-        throw "Get-SecureBootUEFI is not available on this computer."
-    }
-
-    if (-not (Get-Command certutil.exe -ErrorAction SilentlyContinue)) {
-        throw "certutil.exe is not available on this computer."
-    }
-
     $pkDerPath = Join-Path -Path $env:TEMP -ChildPath ("PK-{0}.der" -f ([Guid]::NewGuid().ToString("N")))
 
     try {
-        $secureBootEnabled = $null
-        try {
-            $secureBootEnabled = Confirm-SecureBootUEFI -ErrorAction Stop
-        }
-        catch {
-            try {
-                $secureBootState = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\State" -Name UEFISecureBootEnabled -ErrorAction Stop
+        $getSecureBootUefiAvailable = $null -ne (Get-Command Get-SecureBootUEFI -ErrorAction SilentlyContinue)
+        $certutilAvailable = $null -ne (Get-Command certutil.exe -ErrorAction SilentlyContinue)
+
+        $secureBootEnabled = Confirm-SecureBootUEFI -ErrorAction SilentlyContinue
+        if ($null -eq $secureBootEnabled) {
+            $secureBootState = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\State" -Name "UEFISecureBootEnabled" -ErrorAction SilentlyContinue
+            if ($null -ne $secureBootState -and $null -ne $secureBootState.UEFISecureBootEnabled) {
                 $secureBootEnabled = [bool]$secureBootState.UEFISecureBootEnabled
             }
-            catch {
-                $secureBootEnabled = $null
-            }
         }
 
-        $pkObject = Get-SecureBootUEFI -Name PK -ErrorAction Stop
-        $pkBytes = $pkObject.Bytes
         $pkValid = $false
 
-        if ($null -ne $pkBytes -and $pkBytes.Length -gt 44) {
-            $pkCertBytes = [byte[]]$pkBytes[44..($pkBytes.Length - 1)]
-            [System.IO.File]::WriteAllBytes($pkDerPath, $pkCertBytes)
-
-            $certutilOutputLines = @(
-                & certutil.exe -dump $pkDerPath 2>&1 | ForEach-Object { $_.ToString() }
-            )
-            $certutilExitCode = $LASTEXITCODE
-            $pkCertutilOutput = ($certutilOutputLines -join [Environment]::NewLine)
-
-            $hasBroadcomZeroPayload = (
-                ($pkBytes.Length -eq 45) -or
-                ($pkCertBytes.Length -eq 1 -and $pkCertBytes[0] -eq 0) -or
-                ($pkCertutilOutput -match '(?m)^\s*00\s+\.\s*$')
-            )
-
-            $certificateParsed = $false
-            try {
-                $null = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($pkCertBytes)
-                $certificateParsed = $true
+        if ($getSecureBootUefiAvailable -and $certutilAvailable -and $secureBootEnabled) {
+            $pkObject = Get-SecureBootUEFI -Name PK -ErrorAction SilentlyContinue
+            $pkBytes = $null
+            if ($null -ne $pkObject) {
+                $pkBytes = $pkObject.Bytes
             }
-            catch {
+
+            if ($null -ne $pkBytes -and $pkBytes.Length -gt 44) {
+                $pkCertBytes = [byte[]]$pkBytes[44..($pkBytes.Length - 1)]
+                [System.IO.File]::WriteAllBytes($pkDerPath, $pkCertBytes)
+
+                $certutilOutputLines = @(
+                    & certutil.exe -dump $pkDerPath 2>&1 | ForEach-Object { $_.ToString() }
+                )
+                $certutilExitCode = $LASTEXITCODE
+                $pkCertutilOutput = ($certutilOutputLines -join [Environment]::NewLine)
+
+                $hasBroadcomZeroPayload = (
+                    ($pkBytes.Length -eq 45) -or
+                    ($pkCertBytes.Length -eq 1 -and $pkCertBytes[0] -eq 0) -or
+                    ($pkCertutilOutput -match '(?m)^\s*00\s+\.\s*$')
+                )
+
                 $certificateParsed = $false
-            }
+                try {
+                    $certObject = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 -ArgumentList (, $pkCertBytes)
+                    if ($null -ne $certObject) {
+                        $certificateParsed = $true
+                    }
+                }
+                catch {
+                    $certificateParsed = $false
+                }
 
-            if (-not $hasBroadcomZeroPayload -and $certutilExitCode -eq 0 -and $certificateParsed) {
-                $pkValid = $true
+                if (-not $hasBroadcomZeroPayload -and $certutilExitCode -eq 0 -and $certificateParsed) {
+                    $pkValid = $true
+                }
             }
         }
 
-        $kekObject = Get-SecureBootUEFI -Name KEK -ErrorAction Stop
-        $kekBytes = $kekObject.Bytes
         $hasRequiredKek2023 = $false
 
-        if ($null -ne $kekBytes) {
-            $kekText = [System.Text.Encoding]::ASCII.GetString($kekBytes)
-            $hasRequiredKek2023 = $kekText -match 'Microsoft Corporation KEK 2K CA 2023'
+        if ($getSecureBootUefiAvailable -and $secureBootEnabled) {
+            $kekObject = Get-SecureBootUEFI -Name KEK -ErrorAction SilentlyContinue
+            $kekBytes = $null
+            if ($null -ne $kekObject) {
+                $kekBytes = $kekObject.Bytes
+            }
+
+            if ($null -ne $kekBytes) {
+                $kekText = [System.Text.Encoding]::ASCII.GetString($kekBytes)
+                $hasRequiredKek2023 = $kekText -match 'Microsoft Corporation KEK 2K CA 2023'
+            }
         }
 
         $event1801 = Get-WinEvent -FilterHashtable @{
-            LogName      = "System"
-            ProviderName = "TPM-WMI"
-            Id           = 1801
+            LogName = "System"
+            Id      = 1801
         } -MaxEvents 1 -ErrorAction SilentlyContinue
-
         $hasEvent1801 = $null -ne $event1801
 
         $event1808 = Get-WinEvent -FilterHashtable @{
-            LogName      = "System"
-            ProviderName = "TPM-WMI"
-            Id           = 1808
+            LogName = "System"
+            Id      = 1808
         } -MaxEvents 1 -ErrorAction SilentlyContinue
-
         $hasEvent1808 = $null -ne $event1808
 
         $uefiCa2023Status = $null
-        try {
-            $secureBootServicing = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\Servicing" -Name UEFICA2023Status -ErrorAction Stop
-            $uefiCa2023Status = [string]$secureBootServicing.UEFICA2023Status
-        }
-        catch {
-            $uefiCa2023Status = $null
+        $uefiCa2023StatusItem = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\Servicing" -Name "UEFICA2023Status" -ErrorAction SilentlyContinue
+        if ($null -ne $uefiCa2023StatusItem) {
+            $uefiCa2023Status = [string]$uefiCa2023StatusItem.UEFICA2023Status
         }
 
         $uefiCa2023Error = $null
-        try {
-            $secureBootServicing = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\Servicing" -Name UEFICA2023Error -ErrorAction Stop
-            $uefiCa2023Error = [string]$secureBootServicing.UEFICA2023Error
-        }
-        catch {
-            $uefiCa2023Error = $null
+        $uefiCa2023ErrorItem = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\Servicing" -Name "UEFICA2023Error" -ErrorAction SilentlyContinue
+        if ($null -ne $uefiCa2023ErrorItem) {
+            $uefiCa2023Error = [string]$uefiCa2023ErrorItem.UEFICA2023Error
         }
 
         return [PSCustomObject]@{
