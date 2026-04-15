@@ -117,7 +117,8 @@ function Export-PkStatusReport {
 
 function Get-DeviceStatus {
     param(
-        [Parameter(Mandatory = $true)]
+        [Parameter(Mandatory = $false)]
+        [AllowNull()]
         $SecureBootEnabled,
 
         [Parameter(Mandatory = $true)]
