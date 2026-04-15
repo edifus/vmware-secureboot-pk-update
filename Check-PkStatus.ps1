@@ -1,10 +1,48 @@
-# Connect to your vCenter if not already connected
-# Connect-VIServer -Server "your-vcenter-fqdn"
+<#
+.SYNOPSIS
+Reports Secure Boot-enabled UEFI VMs and their PK update status.
+
+.DESCRIPTION
+Lists virtual machines that use UEFI firmware with Secure Boot enabled and shows
+whether each VM has the PK-Fixed tag assigned. If a VCSA hostname is provided,
+the script connects to that vCenter Server before running the report.
+
+.PARAMETER VCServer
+The VCSA or vCenter Server hostname to connect to before collecting the report.
+
+.PARAMETER ExportCsv
+When specified, exports the report to ./Affected_SecureBoot_VMs.csv.
+
+.EXAMPLE
+pwsh -NoProfile -File ./Check-PkStatus.ps1 -VCServer vcsa.example.local
+
+Connects to the specified VCSA and writes the report to the console.
+
+.EXAMPLE
+pwsh -NoProfile -File ./Check-PkStatus.ps1 -VCServer vcsa.example.local -ExportCsv
+
+Connects to the specified VCSA, writes the report to the console, and saves the
+results to ./Affected_SecureBoot_VMs.csv.
+
+.NOTES
+Requires VMware PowerCLI and permissions to read VM inventory and tag assignments.
+#>
+
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $false)]
+    [string]$VCServer,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$ExportCsv
+)
+
+if ($VCServer) {
+    Connect-VIServer -Server $VCServer | Out-Null
+}
 
 $AffectedVMs = Get-VM | Get-View -Property Name, Config.Firmware, Config.BootOptions, Runtime.Host, Summary.Runtime.PowerState | Where-Object {
-    # Criterion 1: VM is using UEFI firmware
-    $_.Config.Firmware -eq "efi" -and 
-    # Criterion 2: Secure Boot is enabled
+    $_.Config.Firmware -eq "efi" -and
     $_.Config.BootOptions.EfiSecureBootEnabled -eq $true
 }
 
@@ -13,7 +51,7 @@ $Report = foreach ($vmView in $AffectedVMs) {
     $hasPkFixedTag = @(Get-TagAssignment -Entity $vm -ErrorAction SilentlyContinue | Where-Object {
         $_.Tag.Name -eq "PK-Fixed"
     }).Count -gt 0
-    
+
     [PSCustomObject]@{
         VMName      = $vmView.Name
         PowerState  = $vmView.Summary.Runtime.PowerState
@@ -25,7 +63,6 @@ $Report = foreach ($vmView in $AffectedVMs) {
 
 $AffectedVmCount = @($Report).Count
 
-# Output the results to the console
 Write-Host "Affected VM count: $AffectedVmCount"
 
 if ($AffectedVmCount -gt 0) {
@@ -48,5 +85,6 @@ if ($AffectedVmCount -gt 0) {
     Write-Host "No affected VMs found."
 }
 
-# Optional: Export to CSV
-# $Report | Export-Csv -Path "Affected_SecureBoot_VMs.csv" -NoTypeInformation
+if ($ExportCsv) {
+    $Report | Export-Csv -Path "./Affected_SecureBoot_VMs.csv" -NoTypeInformation
+}
