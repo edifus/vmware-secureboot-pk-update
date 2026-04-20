@@ -9,3 +9,6 @@
 *.vmdk
 *-flat.vmdk
 *-ctk.vmdk
+
+# Reports
+*.csv

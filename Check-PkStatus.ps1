@@ -41,7 +41,10 @@ if ($VCServer) {
     Connect-VIServer -Server $VCServer | Out-Null
 }
 
-$AffectedVMs = Get-VM | Get-View -Property Name, Config.Firmware, Config.BootOptions, Runtime.Host, Summary.Runtime.PowerState | Where-Object {
+$AffectedVMs = Get-VM `
+  | Get-View -Property Name, Config.Firmware, Config.BootOptions, Runtime.Host, Summary.Runtime.PowerState `
+  | Sort-Object -Property Name `
+  | Where-Object {
     $_.Config.Firmware -eq "efi" -and
     $_.Config.BootOptions.EfiSecureBootEnabled -eq $true
 }
