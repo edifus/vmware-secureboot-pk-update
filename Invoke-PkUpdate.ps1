@@ -1196,7 +1196,13 @@ try {
             }
         }
         else {
-            throw "No existing vCenter connection was found in this PowerShell process, and no credentials were provided. If you are starting the script with 'pwsh -NoProfile -File', pass -Username/-Password (or set VC_USER/VC_PASS), or run it from the same PowerShell session that already has an active Connect-VIServer connection."
+            try {
+                $activeVIServerConnection = Connect-VIServer -Server $VCServer -ErrorAction Stop
+                $openedVIServerConnection = $true
+            }
+            catch {
+                throw "No existing vCenter connection was found for '$VCServer', and connecting without credentials failed. Provide -Username/-Password (or set VC_USER/VC_PASS) to connect."
+            }
         }
     }
 
